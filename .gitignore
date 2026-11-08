@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project
+data/samples/*
+!data/samples/.gitkeep
+*.mp4
+*.avi
+outputs/
