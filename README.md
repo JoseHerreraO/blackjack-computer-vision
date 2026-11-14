@@ -1,123 +1,123 @@
 # Blackjack Computer Vision 🃏🕶️
 
-Asistente de blackjack basado en **visión por ordenador clásica**. El jugador lleva unas **gafas Meta** cuya cámara captura la mesa en primera persona. El móvil recibe el vídeo de las gafas a través del SDK de Meta (Wearables Device Access Toolkit) y lo reenvía por la red local al ordenador, que es donde se hace todo el análisis. El ordenador reconoce las cartas del jugador y del dealer, recomienda la jugada óptima según la estrategia básica (pedir, plantarse, doblar o separar) y lo muestra en un HUD sobre el vídeo, con conteo Hi-Lo, cartas restantes en el zapato y un historial de decisiones.
+Blackjack assistant built on **classical computer vision**. The player wears **Meta glasses** whose camera captures the table from a first-person view. A phone receives the video from the glasses through Meta's SDK (Wearables Device Access Toolkit) and forwards it over the local network to a computer, where all the analysis happens. The computer recognises the player's and the dealer's cards, recommends the optimal move according to basic strategy (hit, stand, double down or split) and shows it in a HUD over the video, together with the Hi-Lo count, the cards left in the shoe and a decision history.
 
-Antes de usar el asistente hay que desbloquearlo enseñando a la cámara **cuatro ases en un orden secreto de palos**.
+Before it can be used, the assistant has to be unlocked by showing the camera **four aces in a secret suit order**.
 
-Proyecto final de *Visión por Ordenador I* en 3º de Ingeniería Matemática, Universidad Pontificia Comillas ICAI (curso 2026/27).
+Final project for *Computer Vision I*, 3rd year of Mathematical Engineering, Universidad Pontificia Comillas ICAI (2026/27).
 
-**Autores.** José De Oña · José Herrera (Grupo A)
+**Authors.** José De Oña · José Herrera (Group A)
 
-> 🚧 **Estado.** El repositorio tiene la estructura del paquete, los tests y la CI. Los módulos están en desarrollo (ver [Planificación](#planificación)).
+> 🚧 **Status.** The repository contains the package structure, tests and CI. The modules are under development (see [Schedule](#schedule)).
 
 ---
 
-## Arquitectura
+## Architecture
 
 ```
-┌──────────────┐  Bluetooth (SDK de Meta)  ┌──────────────┐  Wi-Fi local (frames)  ┌───────────────────────┐
-│  Gafas Meta  │ ────────────────────────► │  App móvil   │ ─────────────────────► │  Ordenador (Python)   │
-│  (cámara)    │                           │  Android/iOS │                        │  Receptor de frames   │
-└──────────────┘                           └──────────────┘                        └───────────┬───────────┘
-                                                                                               │
-[Calibración offline] ──► K, coeficientes de distorsión, RMS                                   │
-                                   │                                                           ▼
-                                   └──────────► Corrección de distorsión (remap) ──► Detector de cartas
-                                                                                          │
-   ┌──────────────── SISTEMA DE SEGURIDAD ────────────────────────────────────────────────┴───┐
-   │  Detector de palo del as ──► Decodificador de secuencia (4)                              │
-   └───────────────────────────────┬──────────────────────────────────────────────────────────┘
-                                   │ acceso concedido
-   ┌──────────────── SISTEMA PROPUESTO ───────────────────────────────────────────────────────┐
-   │  Tracker (cartas + fichas) ──► Reconocimiento rango/palo                                 │
-   │  ──► Lógica de ronda ──► Estrategia básica + Hi-Lo                                       │
-   │  ──► Salida de vídeo (HUD + FPS)                                                         │
-   └──────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────┐   Bluetooth (Meta SDK)    ┌──────────────┐   Local Wi-Fi (frames)  ┌───────────────────────┐
+│ Meta glasses │ ────────────────────────► │  Phone app   │ ──────────────────────► │   Computer (Python)   │
+│   (camera)   │                           │ Android/iOS  │                         │    Frame receiver     │
+└──────────────┘                           └──────────────┘                         └───────────┬───────────┘
+                                                                                                │
+[Offline calibration] ──► K, distortion coefficients, RMS                                       │
+                                   │                                                            ▼
+                                   └──────────► Distortion correction (remap) ──► Card detector
+                                                                                        │
+   ┌──────────────── SECURITY SYSTEM ───────────────────────────────────────────────────┴───┐
+   │  Ace suit detector ──► Sequence decoder (4)                                            │
+   └───────────────────────────────┬────────────────────────────────────────────────────────┘
+                                   │ access granted
+   ┌──────────────── PROPOSED SYSTEM ───────────────────────────────────────────────────────┐
+   │  Tracker (cards + chips) ──► Rank/suit recognition                                     │
+   │  ──► Round logic ──► Basic strategy + Hi-Lo                                            │
+   │  ──► Video output (HUD + FPS)                                                          │
+   └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-El móvil no hace ningún procesamiento de visión. Solo actúa de puente entre las gafas y el ordenador, que concentra todo el pipeline en Python con OpenCV.
+The phone does no vision processing at all. It only acts as a bridge between the glasses and the computer, which runs the whole pipeline in Python with OpenCV.
 
-| Módulo | Técnica |
+| Module | Technique |
 |---|---|
-| Captura | Cámara de las gafas Meta mediante el Wearables Device Access Toolkit (máximo 720p a 30 FPS por el ancho de banda de Bluetooth). La app móvil reenvía los frames al ordenador por la red local. Plan B con webcam cenital fija conectada al ordenador |
-| Calibración | Tablero de ajedrez fotografiado con las propias gafas y a la misma resolución del stream. `findChessboardCorners` + `cornerSubPix` + `calibrateCamera` (offline). Mapas de `initUndistortRectifyMap` precalculados |
-| Detección de cartas | Otsu / HSV, morfología, `findContours`, `approxPolyDP` (4 vértices, aspecto ≈ 1.4), homografía a 200×300 |
-| Seguridad | Palo del pip central del as por color (HSV) y forma (momentos de Hu). Decodificador de 4 patrones con reset por error, timeout o tecla |
-| Reconocimiento | Bolsa de palabras visuales. SIFT sobre la carta rectificada, vocabulario con K-Means, histograma + SVM (kernel χ²). Filtro por color del palo y votación temporal sobre N frames |
-| Tracker | IDs por asociación de centroides + filtro de Kalman (cartas), CamShift (fichas) |
-| Juego | Máquina de estados de ronda y tablas de estrategia básica (duras, blandas, parejas) |
-| Ampliaciones | Hi-Lo (cuenta corriente y verdadera, ventaja, apuesta), histograma del zapato, log CSV, estudio de vocabulario/kernel y comparación BoW vs. template matching |
+| Capture | Meta glasses camera through the Wearables Device Access Toolkit (up to 720p at 30 FPS, limited by Bluetooth bandwidth). The phone app forwards the frames to the computer over the local network. Fallback with a fixed overhead webcam plugged into the computer |
+| Calibration | Chessboard photographed with the glasses themselves at the stream resolution. `findChessboardCorners` + `cornerSubPix` + `calibrateCamera` (offline). Precomputed `initUndistortRectifyMap` maps |
+| Card detection | Otsu / HSV, morphology, `findContours`, `approxPolyDP` (4 vertices, aspect ratio ≈ 1.4), homography to 200×300 |
+| Security | Suit of the ace's central pip by colour (HSV) and shape (Hu moments). Decoder for 4 patterns with reset on error, timeout or key press |
+| Recognition | Bag of visual words. SIFT on the rectified card, K-Means vocabulary, histogram + SVM (χ² kernel). Suit colour filter and temporal voting over N frames |
+| Tracker | IDs by centroid association + Kalman filter (cards), CamShift (chips) |
+| Game | Round state machine and basic strategy tables (hard, soft, pairs) |
+| Extensions | Hi-Lo (running and true count, edge, bet sizing), shoe histogram, CSV log, vocabulary/kernel study and BoW vs. template matching comparison |
 
-### Consecuencias de usar una cámara en primera persona
+### What a first-person camera changes
 
-La cámara ya no está fija sobre la mesa sino en la cabeza del jugador, así que la imagen se mueve y cambia de perspectiva. La homografía de cada carta corrige la perspectiva de forma individual, pero el tracker tiene que tolerar el movimiento de la cámara entre frames y no solo el de las cartas. La resolución y los FPS de entrada están limitados por el stream de las gafas, que además los reduce automáticamente si el Bluetooth va justo. La calibración tiene que hacerse con imágenes capturadas por las gafas a la resolución final del stream, porque cambiar de resolución invalida la matriz intrínseca.
+The camera is no longer fixed above the table but on the player's head, so the image moves and its perspective changes. Each card's homography corrects its perspective individually, but the tracker has to tolerate camera motion between frames and not only the motion of the cards. Input resolution and FPS are limited by the glasses stream, which also lowers them automatically when the Bluetooth link is tight. Calibration has to be done with images captured by the glasses at the final stream resolution, because changing the resolution invalidates the intrinsic matrix.
 
-### Plan B con cámara cenital fija
+### Fallback with a fixed overhead camera
 
-Como respaldo, el sistema también funciona con una webcam (o un móvil) fija en posición cenital sobre la mesa y conectada directamente al ordenador. En ese modo se salta el puente gafas → móvil y el resto del pipeline es idéntico, así que solo cambia la fuente de frames. Sirve para desarrollar y probar sin depender de las gafas y para la demo si el stream de Bluetooth falla o baja de calidad. Con la cámara fija el tracker lo tiene más fácil, porque solo se mueven las cartas y las fichas. La calibración se hace por separado para cada cámara y se guarda en `data/calibration/` con parámetros distintos para las gafas y para la webcam.
+As a fallback, the system also works with a webcam (or a phone) fixed overhead above the table and plugged directly into the computer. In this mode the glasses → phone bridge is skipped and the rest of the pipeline is identical, so only the frame source changes. It is useful for developing and testing without the glasses, and for the demo if the Bluetooth stream fails or drops in quality. With a fixed camera the tracker has an easier job, because only the cards and chips move. Each camera is calibrated separately and its parameters are stored in `data/calibration/`, with different files for the glasses and for the webcam.
 
-## Estructura del repositorio
+## Repository structure
 
 ```
 .
 ├── src/blackjack_vision/
-│   ├── calibration.py     # Calibración offline con tablero de ajedrez
-│   ├── undistort.py       # Corrección de distorsión (initUndistortRectifyMap + remap)
-│   ├── card_detector.py   # Umbralizado, contornos cuadriláteros y rectificación
-│   ├── recognition.py     # Reconocimiento de rango y palo con bolsa de palabras
-│   ├── security.py        # Detector de palo del as y decodificador de la secuencia
-│   ├── tracker.py         # Seguimiento de cartas y fichas
-│   ├── strategy.py        # Lógica de ronda, estrategia básica y Hi-Lo
-│   └── hud.py             # HUD con recomendación, conteo, historial y FPS
+│   ├── calibration.py     # Offline chessboard calibration
+│   ├── undistort.py       # Distortion correction (initUndistortRectifyMap + remap)
+│   ├── card_detector.py   # Thresholding, quadrilateral contours and rectification
+│   ├── recognition.py     # Rank and suit recognition with a bag of visual words
+│   ├── security.py        # Ace suit detector and password sequence decoder
+│   ├── tracker.py         # Card and chip tracking
+│   ├── strategy.py        # Round logic, basic strategy and Hi-Lo
+│   └── hud.py             # HUD with recommendation, count, history and FPS
 ├── scripts/
-│   ├── calibrate.py       # Ejecuta la calibración y guarda los parámetros
-│   └── run.py             # Lanza el asistente en tiempo real
-├── tests/                 # Tests con pytest
+│   ├── calibrate.py       # Runs the calibration and saves the parameters
+│   └── run.py             # Launches the real-time assistant
+├── tests/                 # pytest tests
 ├── data/
-│   ├── calibration/       # Imágenes del tablero y parámetros de calibración
-│   └── samples/           # Fotos y vídeos de prueba (no se suben al repo)
-├── .github/               # CI (ruff + pytest) y plantilla de pull request
+│   ├── calibration/       # Chessboard images and calibration parameters
+│   └── samples/           # Test photos and videos (not committed)
+├── .github/               # CI (ruff + pytest) and pull request template
 ├── pyproject.toml
 └── requirements.txt
 ```
 
-Faltan por añadir el receptor de frames del lado del ordenador y la app móvil que usa el SDK de Meta.
+The computer-side frame receiver and the phone app that uses Meta's SDK are still to be added.
 
-## Instalación y uso
+## Installation and usage
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate          # Windows  (en Linux/macOS: source .venv/bin/activate)
+.venv\Scripts\activate          # Windows  (on Linux/macOS: source .venv/bin/activate)
 pip install -r requirements.txt
 ```
 
 ```bash
-python scripts/calibrate.py     # calibración offline de la cámara de las gafas
-python scripts/run.py           # asistente en tiempo real
+python scripts/calibrate.py     # offline calibration of the glasses camera
+python scripts/run.py           # real-time assistant
 ```
 
-Para comprobar el código antes de abrir una pull request se ejecutan los mismos pasos que la CI.
+Before opening a pull request, run the same checks as the CI.
 
 ```bash
 ruff check .
 pytest
 ```
 
-## Material
+## Hardware
 
-Unas gafas Meta compatibles con el Wearables Device Access Toolkit, un móvil Android o iOS con la app puente, un ordenador en la misma red Wi-Fi, una baraja francesa estándar, fichas de colores y un tapete de color uniforme. Para el plan B hace falta además una webcam (o un móvil) con soporte para montarla en posición cenital sobre la mesa.
+Meta glasses supported by the Wearables Device Access Toolkit, an Android or iOS phone running the bridge app, a computer on the same Wi-Fi network, a standard 52-card deck, coloured chips and a plain-coloured table mat. The fallback also needs a webcam (or a phone) with a stand to mount it overhead above the table.
 
-## Planificación
+## Schedule
 
-| Fechas | Tareas | Estado |
+| Dates | Tasks | Status |
 |---|---|---|
-| 4–7 nov | Repositorio, lectura de cámara y propuesta | ✅ |
-| 8–14 nov | Estructura del paquete y CI. Calibración, detector y reconocimiento de cartas | ⏳ |
-| 15–20 nov | App puente gafas → móvil → ordenador. Sistema de seguridad, lógica de ronda y estrategia básica | ⏳ |
-| 21–26 nov | Tracker, Hi-Lo, zapato, log, HUD y optimización | ⏳ |
-| 27–30 nov | Informe, vídeo demo y póster | ⏳ |
-| 2 dic | Entrega y presentación | ⏳ |
+| 4–7 Nov | Repository, camera capture and proposal | ✅ |
+| 8–14 Nov | Package structure and CI. Calibration, card detection and recognition | ⏳ |
+| 15–20 Nov | Glasses → phone → computer bridge app. Security system, round logic and basic strategy | ⏳ |
+| 21–26 Nov | Tracker, Hi-Lo, shoe, log, HUD and optimisation | ⏳ |
+| 27–30 Nov | Report, demo video and poster | ⏳ |
+| 2 Dec | Submission and presentation | ⏳ |
 
-## Licencia
+## License
 
 [MIT](LICENSE)
