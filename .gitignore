@@ -225,3 +225,8 @@ data/samples/*
 *.mp4
 *.avi
 outputs/
+
+# Calibration captures (only the JSON camera models are versioned)
+data/calibration/**
+!data/calibration/.gitkeep
+!data/calibration/*.json
