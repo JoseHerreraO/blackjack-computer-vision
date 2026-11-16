@@ -61,22 +61,20 @@ As a fallback, the system also works with a webcam (or a phone) fixed overhead a
 ```
 .
 ├── src/blackjack_vision/
-│   ├── calibration.py     # Offline chessboard calibration
-│   ├── undistort.py       # Distortion correction (initUndistortRectifyMap + remap)
-│   ├── card_detector.py   # Thresholding, quadrilateral contours and rectification
-│   ├── recognition.py     # Rank and suit recognition with a bag of visual words
-│   ├── security.py        # Ace suit detector and password sequence decoder
-│   ├── tracker.py         # Card and chip tracking
-│   ├── strategy.py        # Round logic, basic strategy and Hi-Lo
-│   └── hud.py             # HUD with recommendation, count, history and FPS
-├── scripts/
-│   ├── calibrate.py       # Runs the calibration and saves the parameters
-│   └── run.py             # Launches the real-time assistant
-├── tests/                 # pytest tests
+│   ├── capture/              # Frame sources: webcam, video files, image folders, glasses stream
+│   ├── calibration/          # Chessboard calibration, camera model and undistortion (Tema 2)
+│   ├── detection_tracking/   # Card and hand detection, multi-object tracking (Tema 5)
+│   ├── vision_classic/       # Vertex refinement, homography rectification, rank/suit recognition
+│   ├── security/             # Ace-sequence unlock: pattern detector + sequence decoder
+│   ├── blackjack/            # Cards, hands, basic strategy, Hi-Lo count and round state machine
+│   └── ui/                   # HUD on the PC and feedback to the glasses
+├── scripts/                  # Command-line entry points (calibration, previews, live assistant)
+├── tests/                    # pytest tests (synthetic data, no hardware needed)
+├── docs/                     # Technical guides and design notes
 ├── data/
-│   ├── calibration/       # Chessboard images and calibration parameters
-│   └── samples/           # Test photos and videos (not committed)
-├── .github/               # CI (ruff + pytest) and pull request template
+│   ├── calibration/          # Camera models (JSON) and calibration captures
+│   └── samples/              # Test photos and videos (not committed)
+├── .github/                  # CI (ruff + pytest) and pull request template
 ├── pyproject.toml
 └── requirements.txt
 ```
@@ -89,10 +87,11 @@ The computer-side frame receiver and the phone app that uses Meta's SDK are stil
 python -m venv .venv
 .venv\Scripts\activate          # Windows  (on Linux/macOS: source .venv/bin/activate)
 pip install -r requirements.txt
+pip install -e .                # makes blackjack_vision importable from scripts/
 ```
 
 ```bash
-python scripts/calibrate.py     # offline calibration of the glasses camera
+python scripts/calibrate.py --source <video|folder|camera> --name glasses_high   # see docs/calibration.md
 python scripts/run.py           # real-time assistant
 ```
 
