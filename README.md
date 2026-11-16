@@ -92,6 +92,7 @@ pip install -e .                # makes blackjack_vision importable from scripts
 
 ```bash
 python scripts/calibrate.py --source <video|folder|camera> --name glasses_high   # see docs/calibration.md
+python scripts/preview_detection.py --source <video|folder|camera>              # tune the card detector
 python scripts/run.py           # real-time assistant
 ```
 
