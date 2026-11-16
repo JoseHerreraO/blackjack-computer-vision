@@ -1,9 +1,10 @@
 # Builds unsigned iOS .ipa files on a macOS runner (we have no Mac).
 # The .ipa is downloaded from the run's artifacts and sideloaded with Sideloadly.
 #
-# Step 0 (feasibility): builds Meta's official CameraAccess sample, unmodified except
-# for the stream resolution and frame rate, so we can check that sideloading with a
-# free Apple ID works and measure the real FPS from the glasses.
+# Step 0 (feasibility): builds Meta's official CameraAccess sample so we can check that
+# sideloading with a free Apple ID works and measure the real FPS from the glasses. The
+# only changes are the stream resolution and frame rate, plus the Bluetooth Classic
+# Info.plist entries that the DAT guide requires and the sample leaves out.
 #
 # macOS minutes are expensive on a private repo: batch changes before triggering.
 
@@ -68,7 +69,7 @@ jobs:
           grep -n -A2 'repositoryURL' dat/samples/CameraAccess/CameraAccess.xcodeproj/project.pbxproj
 
       - name: Cache Swift packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build/SourcePackages
           key: spm-dat-${{ env.DAT_VERSION }}-${{ hashFiles('dat/samples/CameraAccess/CameraAccess.xcodeproj/project.pbxproj') }}
@@ -84,6 +85,20 @@ jobs:
           grep -q 'resolution: StreamingResolution.low,' "$SWIFT_FILE"
           grep -q 'frameRate: 24$' "$SWIFT_FILE"
           cp "$SWIFT_FILE" "$SWIFT_FILE.orig"
+
+          # DAT streams the camera over Bluetooth Classic, which needs the external-accessory
+          # background mode and the com.meta.ar.wearable accessory protocol (see the DAT
+          # getting-started guide). The sample's Info.plist declares neither, so without
+          # them the session starts but the preview fails with "device not connected".
+          PLIST=CameraAccess/Info.plist
+          plutil -p "$PLIST" | grep -q '"external-accessory"' \
+            || plutil -insert UIBackgroundModes -string external-accessory -append "$PLIST"
+          plutil -extract UISupportedExternalAccessoryProtocols xml1 -o /dev/null "$PLIST" 2>/dev/null \
+            || plutil -insert UISupportedExternalAccessoryProtocols -array "$PLIST"
+          plutil -p "$PLIST" | grep -q '"com.meta.ar.wearable"' \
+            || plutil -insert UISupportedExternalAccessoryProtocols -string com.meta.ar.wearable -append "$PLIST"
+          plutil -lint "$PLIST"
+          plutil -p "$PLIST" | grep -A6 -E 'UIBackgroundModes|UISupportedExternalAccessoryProtocols'
 
           for FPS in $FRAME_RATES; do
             echo "::group::Build ${RESOLUTION} @ ${FPS} fps"
@@ -128,7 +143,7 @@ jobs:
 
       - name: Upload .ipa files and build logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CameraAccess-${{ env.RESOLUTION }}
           path: ipa/
