@@ -230,3 +230,7 @@ outputs/
 data/calibration/**
 !data/calibration/.gitkeep
 !data/calibration/*.json
+
+# Card dataset (rectified photos) and trained recognisers
+data/cards/
+data/models/
