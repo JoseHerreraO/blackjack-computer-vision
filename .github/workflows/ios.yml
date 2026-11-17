@@ -1,10 +1,15 @@
 # Builds unsigned iOS .ipa files on a macOS runner (we have no Mac).
 # The .ipa is downloaded from the run's artifacts and sideloaded with Sideloadly.
 #
-# Step 0 (feasibility): builds Meta's official CameraAccess sample so we can check that
-# sideloading with a free Apple ID works and measure the real FPS from the glasses. The
-# only changes are the stream resolution and frame rate, plus the Bluetooth Classic
-# Info.plist entries that the DAT guide requires and the sample leaves out.
+# bridge-app: our app in mobile/ios. The Xcode project is not versioned, it is generated
+# here with XcodeGen from mobile/ios/project.yml. Runs on every push that touches
+# mobile/ios/** and on manual runs with target=app.
+#
+# camera-access-sample: Meta's official CameraAccess sample, used for the step 0
+# feasibility check (sideloading with a free Apple ID and measuring the real FPS). Only
+# on manual runs with target=sample. The only changes are the stream resolution and
+# frame rate, plus the Bluetooth Classic Info.plist entries that the DAT guide requires
+# and the sample leaves out.
 #
 # macOS minutes are expensive on a private repo: batch changes before triggering.
 
@@ -13,13 +18,18 @@ name: iOS
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: "What to build"
+        type: choice
+        options: [app, sample]
+        default: app
       resolution:
-        description: "DAT stream resolution (high = 720x1280, medium = 504x896, low = 360x640)"
+        description: "Sample only. DAT stream resolution (high = 720x1280, medium = 504x896, low = 360x640)"
         type: choice
         options: [high, medium, low]
         default: high
       frame_rates:
-        description: "Space-separated frame rates, one .ipa each (valid: 2 7 15 24 30)"
+        description: "Sample only. Space-separated frame rates, one .ipa each (valid: 2 7 15 24 30)"
         type: string
         default: "15 24"
   push:
@@ -38,20 +48,102 @@ env:
   DAT_VERSION: "1.0.1"
   DAT_SAMPLE_SHA: bbae597cd1c748cd29b9375a1624a8d75b1c9e14
   MIN_XCODE: "26.4"
-  BUNDLE_ID_PREFIX: es.icai.blackjackvision.cameraaccess
 
 jobs:
+  bridge-app:
+    name: Bridge app (unsigned .ipa)
+    if: github.event_name == 'push' || inputs.target == 'app'
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: mobile/ios
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select the newest Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          VERSION=$(xcodebuild -version | awk 'NR==1 {print $2}')
+          if [ "$(printf '%s\n%s\n' "$MIN_XCODE" "$VERSION" | sort -V | head -n 1)" != "$MIN_XCODE" ]; then
+            echo "::error::DAT $DAT_VERSION needs Xcode $MIN_XCODE+, newest on this runner is $VERSION"
+            exit 1
+          fi
+
+      - name: Generate the Xcode project with XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+          xcodegen generate
+          plutil -lint Generated/Info.plist
+
+      - name: Cache Swift packages
+        uses: actions/cache@v5
+        with:
+          path: mobile/ios/build/SourcePackages
+          key: spm-bridge-${{ hashFiles('mobile/ios/project.yml') }}
+
+      - name: Build unsigned .ipa
+        run: |
+          set -euo pipefail
+          mkdir -p ../../ipa
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          LOG=../../ipa/build-${SHORT_SHA}.log
+          if ! xcodebuild build \
+            -project BlackjackBridge.xcodeproj \
+            -scheme BlackjackBridge \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            > "$LOG" 2>&1; then
+            grep -E 'error:' "$LOG" | head -n 60 || true
+            tail -n 40 "$LOG"
+            echo "::error::xcodebuild failed (full log in the artifact)"
+            exit 1
+          fi
+          grep -E 'BUILD SUCCEEDED' "$LOG"
+          grep -E 'warning:' "$LOG" | sort -u | head -n 30 || true
+
+          APP=build/Build/Products/Release-iphoneos/BlackjackBridge.app
+          # Guard against losing the keys that step 0 proved necessary.
+          plutil -p "$APP/Info.plist" | grep -q '"external-accessory"'
+          plutil -p "$APP/Info.plist" | grep -q '"com.meta.ar.wearable"'
+          plutil -p "$APP/Info.plist" | grep -q 'NSLocalNetworkUsageDescription'
+
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          zip -qry "../../ipa/BlackjackBridge-${GITHUB_RUN_NUMBER}-${SHORT_SHA}.ipa" Payload
+          cp Generated/Info.plist ../../ipa/
+          ls -lh ../../ipa
+
+      - name: Upload .ipa and build log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: BlackjackBridge-${{ github.run_number }}
+          path: ipa/
+          retention-days: 14
+
   camera-access-sample:
     name: CameraAccess sample (unsigned .ipa)
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'sample'
     runs-on: macos-26
     timeout-minutes: 30
     env:
-      RESOLUTION: ${{ inputs.resolution || 'high' }}
-      FRAME_RATES: ${{ inputs.frame_rates || '15 24' }}
+      RESOLUTION: ${{ inputs.resolution }}
+      FRAME_RATES: ${{ inputs.frame_rates }}
+      BUNDLE_ID_PREFIX: es.icai.blackjackvision.cameraaccess
     steps:
       - name: Select the newest Xcode
         run: |
-          ls -d /Applications/Xcode*.app
           XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)
           sudo xcode-select -s "$XCODE"
           xcodebuild -version
@@ -137,8 +229,6 @@ jobs:
             echo "::endgroup::"
           done
 
-          # Entitlements the sample asks for: Sideloadly has to grant them with a free Apple ID.
-          cp CameraAccess/CameraAccess.entitlements "$GITHUB_WORKSPACE/ipa/"
           ls -lh "$GITHUB_WORKSPACE/ipa"
 
       - name: Upload .ipa files and build logs
