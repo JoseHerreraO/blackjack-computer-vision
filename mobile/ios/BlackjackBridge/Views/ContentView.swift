@@ -4,6 +4,7 @@
 // Single screen: PC address, stream settings, status and the on-screen log panel.
 //
 
+import MWDATCore
 import SwiftUI
 import UIKit
 
@@ -13,12 +14,47 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
+                glassesSection
                 pcSection
                 streamSection
                 statusSection
                 logSection
             }
             .navigationTitle("BJ Bridge")
+        }
+    }
+
+    private var glassesSection: some View {
+        let glasses = model.glasses
+        return Section("Glasses") {
+            GlassesPreview(glasses: glasses)
+                .listRowInsets(EdgeInsets())
+
+            if !glasses.isRegistered {
+                Button("Connect glasses (Meta AI)") { glasses.connectGlasses() }
+                    .disabled(glasses.registrationState == .registering)
+            } else if !glasses.hasSession {
+                Button("Start session") { glasses.startSession() }
+                    .disabled(!glasses.hasActiveDevice)
+            } else {
+                if glasses.hasStream {
+                    Button("Stop stream") { glasses.stopStreaming() }
+                } else {
+                    Button("Start stream") { model.startGlassesStream() }
+                        .disabled(!glasses.isSessionStarted)
+                }
+                Button("End session", role: .destructive) { glasses.endSession() }
+            }
+
+            LabeledContent("Registration", value: String(describing: glasses.registrationState))
+            LabeledContent("Glasses", value: glasses.hasActiveDevice ? "available" : "not found")
+            LabeledContent("Session", value: String(describing: glasses.sessionState))
+            LabeledContent("Stream", value: String(describing: glasses.streamState))
+            LabeledContent("Frame size", value: glasses.frameSize.map { "\(Int($0.width))×\(Int($0.height))" } ?? "–")
+            LabeledContent(
+                "Received",
+                value: String(format: "%.1f fps", glasses.receivedFps) + " (\(glasses.framesReceived) frames)"
+            )
         }
     }
 
@@ -49,6 +85,8 @@ struct ContentView: View {
                 }
             }
         }
+        // The configuration is fixed when the stream starts.
+        .disabled(model.glasses.hasStream)
     }
 
     private var statusSection: some View {
@@ -75,6 +113,27 @@ struct ContentView: View {
             }
             .textCase(nil)
         }
+    }
+}
+
+/// Live frame from the glasses, shown as delivered (portrait, not cropped).
+private struct GlassesPreview: View {
+    let glasses: GlassesController
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let frame = glasses.currentFrame {
+                Image(uiImage: frame)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Text(glasses.hasStream ? "Waiting for frames…" : "No video")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+        }
+        .frame(height: 360)
     }
 }
 

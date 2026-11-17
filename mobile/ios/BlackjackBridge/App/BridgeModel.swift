@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import MWDATCamera
 import MWDATCore
 import Observation
 
@@ -26,7 +27,8 @@ final class BridgeModel {
         static let frameRate = "streamFrameRate"
     }
 
-    let log = LogStore()
+    let log: LogStore
+    let glasses: GlassesController
 
     /// PC receiver as "host:port", persisted in UserDefaults.
     var serverAddressText: String {
@@ -48,12 +50,15 @@ final class BridgeModel {
 
     var serverAddress: ServerAddress? { ServerAddress(serverAddressText) }
 
-    let appVersion: String = {
+    /// "0.1.0 (42)": marketing version and CI run number.
+    static let appVersion: String = {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "\(version) (\(build))"
     }()
+
+    var appVersion: String { Self.appVersion }
 
     init() {
         let defaults = UserDefaults.standard
@@ -63,13 +68,24 @@ final class BridgeModel {
         let storedRate = UInt(defaults.integer(forKey: DefaultsKey.frameRate))
         frameRate = StreamSettings.frameRates.contains(storedRate) ? storedRate : StreamSettings.defaultFrameRate
 
-        log.add("BJ Bridge \(appVersion) started")
+        let log = LogStore()
+        self.log = log
+        log.add("BJ Bridge \(Self.appVersion) started")
+        // The SDK must be configured before Wearables.shared is used.
         do {
             try Wearables.configure()
             log.add("Wearables SDK configured")
         } catch {
             log.add("Wearables SDK configuration failed: \(error.localizedDescription)")
         }
+        glasses = GlassesController(wearables: Wearables.shared, log: log)
+    }
+
+    /// Starts the glasses stream with the resolution and frame rate chosen on screen.
+    func startGlassesStream() {
+        log.add("Requesting \(resolution.label) @ \(frameRate) fps")
+        let configuration = StreamSettings.configuration(resolution: resolution, frameRate: frameRate)
+        Task { await glasses.startStreaming(configuration: configuration) }
     }
 
     /// Placeholder until the TCP client exists (step 3).
