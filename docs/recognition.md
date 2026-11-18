@@ -6,7 +6,7 @@ The recogniser receives a card already detected and rectified to 200 × 300 px
 | Output | Method | Module |
 |--------|--------|--------|
 | Rank (13 classes) | Dense RootSIFT on the whole card → K-Means vocabulary (`cv2.kmeans`) → spatial-pyramid bag of words (1×1, 2×2, 4×4) → SVM with χ² kernel | `vision_classic/features.py`, `vision_classic/recognition.py` |
-| Suit (4 classes) | Red or black from the ink of the two index corners (HSV), then the shape of the suit symbol under the rank (log Hu moments, solidity, aspect, extent, width profile) → RBF SVM | `vision_classic/suit_shape.py` |
+| Suit (4 classes) | Red or black from the ink of the two index corners (HSV, Tema 2), then the suit symbol under the rank, isolated with Otsu thresholding and connected components, normalised to 32 × 32 and matched by normalised cross-correlation against one template per suit (Tema 3) | `vision_classic/suit_templates.py` |
 
 The detector does not know which short side of a card is the top, so cards may arrive rotated
 by 180°: the rank SVM is trained on both orientations and the suit uses both index corners.

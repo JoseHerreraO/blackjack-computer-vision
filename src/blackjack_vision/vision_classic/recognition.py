@@ -8,11 +8,12 @@
   the face-card artwork tell the 13 ranks apart (what Blackjack and the Hi-Lo count need). The
   detector cannot tell which short side of a card is the top, so every training card is also
   used rotated by 180 degrees.
-* **Suit**: colour, then shape. The fraction of red ink in the index corners decides whether the
-  suit is red or black, and the shape of the suit symbol under the rank
-  (:mod:`blackjack_vision.vision_classic.suit_shape`) picks one of the two suits of that colour.
-  In a bag of words the small symbol is diluted among the pips, which confuses spades with clubs
-  and hearts with diamonds.
+* **Suit**: colour, then template matching (Tema 3). The fraction of red ink in the index corners
+  (HSV, Tema 2) decides whether the suit is red or black, and the normalised cross-correlation of
+  the suit symbol under the rank with one template per suit
+  (:mod:`blackjack_vision.vision_classic.suit_templates`) picks one of the two suits of that
+  colour. In a bag of words the small symbol is diluted among the pips, which confuses spades
+  with clubs and hearts with diamonds.
 
 A single frame can still be wrong (blur, glare), so per-card predictions are meant to be smoothed
 over time with :class:`TemporalVoter` once the tracker assigns stable IDs.
@@ -41,11 +42,11 @@ from blackjack_vision.vision_classic.features import (
     SiftExtractor,
     Vocabulary,
 )
-from blackjack_vision.vision_classic.suit_shape import SuitShapeClassifier
+from blackjack_vision.vision_classic.suit_templates import SuitTemplates, corner_symbols
 
 logger = logging.getLogger(__name__)
 
-MODEL_FORMAT_VERSION = 1
+MODEL_FORMAT_VERSION = 2
 RED_INK_THRESHOLD = 0.25
 INDEX_REGION = (0.22, 0.32)
 """Width and height of each index corner, as fractions of the card."""
@@ -62,7 +63,6 @@ class RecognizerConfig:
         vocabulary_size: Number of visual words.
         pyramid_levels: Grid sides of the spatial pyramid.
         svm_c: Regularisation constant of the rank SVM.
-        suit_c: Regularisation constant of the suit shape SVM.
         index_region: Width and height of an index corner, as fractions of the card.
         augment_rotation: Also train the rank SVM on every card rotated by 180 degrees.
         colour_filter: Restrict the suit to the colour of the ink in the index corners.
@@ -74,7 +74,6 @@ class RecognizerConfig:
     vocabulary_size: int = 300
     pyramid_levels: tuple[int, ...] = (1, 2, 4)
     svm_c: float = 10.0
-    suit_c: float = 10.0
     index_region: tuple[float, float] = INDEX_REGION
     augment_rotation: bool = True
     colour_filter: bool = True
@@ -84,8 +83,8 @@ class RecognizerConfig:
     def __post_init__(self) -> None:
         if self.vocabulary_size < 2:
             raise ValueError("vocabulary_size must be at least 2")
-        if self.svm_c <= 0 or self.suit_c <= 0:
-            raise ValueError("svm_c and suit_c must be positive")
+        if self.svm_c <= 0:
+            raise ValueError("svm_c must be positive")
         width, height = self.index_region
         if not (0 < width <= 0.5 and 0 < height <= 0.5):
             raise ValueError(f"Invalid index_region {self.index_region}")
@@ -199,14 +198,14 @@ class CardRecognizer:
         self.extractor = SiftExtractor(self.config.features)
         self.encoder: BowEncoder | None = None
         self.rank_svm: Chi2SVM | None = None
-        self.suit_classifier: SuitShapeClassifier | None = None
+        self.suit_templates: SuitTemplates | None = None
 
     @property
     def is_trained(self) -> bool:
-        return self.rank_svm is not None and self.suit_classifier is not None
+        return self.rank_svm is not None and self.suit_templates is not None
 
     def fit(self, images: Sequence[np.ndarray], cards: Sequence[Card]) -> CardRecognizer:
-        """Train the vocabulary, the rank SVM and the suit shape classifier.
+        """Train the vocabulary, the rank SVM and the suit templates.
 
         Args:
             images: Rectified cards (BGR), e.g. the output of ``rectify_card``.
@@ -237,7 +236,7 @@ class CardRecognizer:
         self.encoder = BowEncoder(vocabulary, config.pyramid_levels, config.features.image_size)
         histograms = np.stack([self.encoder.encode(*f) for f in features])
         self.rank_svm = Chi2SVM(config.svm_c).fit(histograms, ranks)
-        self.suit_classifier = SuitShapeClassifier(config.suit_c).fit(
+        self.suit_templates = SuitTemplates().fit(
             [index_corners(image, config.index_region) for image in images],
             [card.suit for card in cards],
         )
@@ -267,23 +266,21 @@ class CardRecognizer:
             return []
         rank_scores = self.rank_svm.scores(np.stack([self.histogram(image) for image in images]))
         rank_classes = self.rank_svm.classes
-        suit_classes = self.suit_classifier.classes
-        red_suits = np.array([Suit(code).is_red for code in suit_classes])
-        both_colours = red_suits.any() and (~red_suits).any()
+        known = self.suit_templates.suits
+        both_colours = any(s.is_red for s in known) and any(not s.is_red for s in known)
 
         predictions = []
         for image, scores in zip(images, rank_scores, strict=True):
             rank_index, rank_margin = _best(scores)
             corners = index_corners(image, self.config.index_region)
             red_ink = red_ink_fraction(image, self.config.index_region)
-            suit, suit_margin = None, 0.0
-            suit_scores = self.suit_classifier.scores(corners)
-            if suit_scores is not None:
-                if self.config.colour_filter and both_colours:
-                    allowed = red_suits if red_ink >= RED_INK_THRESHOLD else ~red_suits
-                    suit_scores = np.where(allowed, suit_scores, -np.inf)
-                suit_index, suit_margin = _best(suit_scores)
-                suit = Suit(suit_classes[suit_index])
+            allowed = None
+            if self.config.colour_filter and both_colours:
+                red = red_ink >= RED_INK_THRESHOLD
+                allowed = [s for s in known if s.is_red == red]
+            suit, suit_margin = self.suit_templates.classify(
+                corner_symbols(corners), allowed=allowed
+            )
             predictions.append(
                 Prediction(Rank(rank_classes[rank_index]), suit, rank_margin, suit_margin, red_ink)
             )
@@ -300,7 +297,7 @@ class CardRecognizer:
             "config": self.config.to_dict(),
             "words": self.encoder.vocabulary.words,
             "rank_svm": self.rank_svm,
-            "suit_classifier": self.suit_classifier,
+            "suit_templates": self.suit_templates,
         }
         joblib.dump(state, path, compress=3)
         return path
@@ -320,7 +317,7 @@ class CardRecognizer:
             Vocabulary(state["words"]), config.pyramid_levels, config.features.image_size
         )
         recognizer.rank_svm = state["rank_svm"]
-        recognizer.suit_classifier = state["suit_classifier"]
+        recognizer.suit_templates = state["suit_templates"]
         return recognizer
 
 
