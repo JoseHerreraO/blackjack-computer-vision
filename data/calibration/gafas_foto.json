@@ -1,0 +1,24 @@
+{
+  "name": "gafas_foto",
+  "image_size": {
+    "width": 3024,
+    "height": 4032
+  },
+  "camera_matrix": [
+    [2147.6220726263796, 0.0, 1538.857658751915],
+    [0.0, 2137.1208456734994, 1981.6557446894772],
+    [0.0, 0.0, 1.0]
+  ],
+  "dist_coeffs": [-0.016262831467367334, 0.02467380965425883, 0.0, 0.0, 0.0],
+  "rms": 0.32903112762556797,
+  "metadata": {
+    "method": "Zhang chessboard calibration with release object (cv2.calibrateCameraRO)",
+    "pattern": "6x4",
+    "square_size": 25.0,
+    "n_views": 15,
+    "flags": 136,
+    "release_object": true,
+    "opencv_version": "5.0.0",
+    "created": "2026-11-18T20:02:28+00:00"
+  }
+}

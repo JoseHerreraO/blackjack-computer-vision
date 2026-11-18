@@ -68,6 +68,17 @@ python scripts/calibrate.py --source data/calibration/webcam/ --pattern 9x6 --sq
 python scripts/calibrate.py --source 0 --pattern 9x6 --square-size 25 --name webcam
 ```
 
+**Imperfect printed boards.** A sheet that is not perfectly flat (or not printed exactly to
+scale) puts a floor under the RMS error that no camera model can remove. `--detector sb` uses the
+more accurate `findChessboardCornersSB`, `--release-object` estimates the board shape together
+with the camera (`calibrateCameraRO`; take every photo from the same side of the board) and
+`--max-plane-error 0.6` drops views far from a flat board (blur, lifted paper). With the glasses
+photos these brought the RMS from 0.55 px to 0.33 px (leave-one-out 0.39 px):
+
+```bash
+python scripts/calibrate.py --source data/calibration/gafas_foto/ --pattern 6x4 --square-size 25 \n    --name gafas_foto --detector sb --release-object --fix-k3 --zero-tangent
+```
+
 Views whose reprojection error is far above the others (blur, wrong detections) are discarded
 automatically and the calibration is repeated once; use `--keep-outliers` to disable it.
 `--fix-k3` helps with few views or narrow lenses, `--rational` with very wide-angle lenses.
