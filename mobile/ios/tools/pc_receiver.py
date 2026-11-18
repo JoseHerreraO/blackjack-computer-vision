@@ -120,29 +120,46 @@ class Receiver:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("0.0.0.0", port))
-        server.listen(1)
-        print(f"Listening on port {port}. Type this in the app: {local_ip()}:{port}")
+        server.listen(4)
+        addresses = ", ".join(f"{ip}:{port}" for ip in local_ips())
+        print(f"Listening on port {port}. Type one of these in the app: {addresses}")
+        print(
+            "(192.168.137.1 is the Windows mobile hotspot, the one to use on the university Wi-Fi)"
+        )
         while True:
             client, address = server.accept()
             client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            print(f"+ iPhone connected from {address[0]}:{address[1]}")
+            enable_keepalive(client)
+            # If the iPhone vanished without closing (Wi-Fi lost, app suspended), the old
+            # connection never reports an error. A new connection means the app reconnected,
+            # so it replaces the old one instead of waiting behind it.
             with self.lock:
-                self.client = client
-            try:
-                self.read_messages(client)
-            except (ConnectionError, OSError) as error:
-                print(f"- Connection lost: {error}")
-            finally:
-                with self.lock:
+                previous, self.client = self.client, client
+            if previous is not None:
+                print("- A new connection replaces the previous one")
+                close_quietly(previous)
+            threading.Thread(target=self.handle_client, args=(client, address), daemon=True).start()
+
+    def handle_client(self, client: socket.socket, address: tuple[str, int]) -> None:
+        print(f"+ iPhone connected from {address[0]}:{address[1]}")
+        try:
+            self.read_messages(client)
+        except (ConnectionError, OSError) as error:
+            print(f"- Connection lost: {error}")
+        finally:
+            with self.lock:
+                if self.client is client:
                     self.client = None
-                client.close()
-                print("- iPhone disconnected, waiting for it to reconnect")
+            close_quietly(client)
+            print("- iPhone disconnected, waiting for it to reconnect")
 
     def read_messages(self, client: socket.socket) -> None:
         while True:
             kind, length = HEADER.unpack(read_exact(client, HEADER.size))
             if length > MAX_PAYLOAD:
-                raise ConnectionError(f"message too large ({length} bytes), is this the BJ Bridge app?")
+                raise ConnectionError(
+                    f"message too large ({length} bytes), is this the BJ Bridge app?"
+                )
             payload = read_exact(client, length)
             if kind == HELLO:
                 self.hello = json.loads(payload)
@@ -173,7 +190,11 @@ class Receiver:
             arrivals = list(self.arrivals)
             frames = self.frames
         recent = [t for t in arrivals if arrivals[-1] - t <= 2] if arrivals else []
-        fps = (len(recent) - 1) / (recent[-1] - recent[0]) if len(recent) > 1 and recent[-1] > recent[0] else 0.0
+        fps = (
+            (len(recent) - 1) / (recent[-1] - recent[0])
+            if len(recent) > 1 and recent[-1] > recent[0]
+            else 0.0
+        )
         return fps, frames
 
 
@@ -187,16 +208,45 @@ def read_exact(client: socket.socket, length: int) -> bytes:
     return bytes(data)
 
 
-def local_ip() -> str:
-    """LAN address of this PC (no packet is sent, it only picks the outgoing interface)."""
+def enable_keepalive(sock: socket.socket) -> None:
+    """Detect a vanished iPhone in about 15 s instead of waiting forever."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):  # Windows: on, 5 s idle, 1 s between probes
+        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 1000))
+    elif hasattr(socket, "TCP_KEEPIDLE"):  # Linux
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 10)
+
+
+def close_quietly(sock: socket.socket) -> None:
+    """Close a socket and wake up any thread blocked reading it."""
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    sock.close()
+
+
+def local_ips() -> list[str]:
+    """IPv4 addresses of this PC, the outgoing interface first."""
+    found: list[str] = []
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        probe.connect(("8.8.8.8", 80))
-        return probe.getsockname()[0]
+        probe.connect(("8.8.8.8", 80))  # picks the outgoing interface, sends nothing
+        found.append(probe.getsockname()[0])
     except OSError:
-        return "127.0.0.1"
+        pass
     finally:
         probe.close()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in found and not ip.startswith(("127.", "169.254.")):
+                found.append(ip)
+    except OSError:
+        pass
+    return found or ["127.0.0.1"]
 
 
 def read_terminal(receiver: Receiver) -> None:
@@ -210,16 +260,24 @@ def read_terminal(receiver: Receiver) -> None:
             print("Commands: say <text> | status <text>")
 
 
-def draw_label(image: np.ndarray, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
+def draw_label(
+    image: np.ndarray, text: str, origin: tuple[int, int], color: tuple[int, int, int]
+) -> None:
     cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
     cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--port", type=int, default=5050)
-    parser.add_argument("--out", type=Path, help="folder for saved frames (default data/samples/<date-time>)")
-    parser.add_argument("--every", type=int, default=1, help="while recording, keep 1 frame out of N (1)")
+    parser.add_argument(
+        "--out", type=Path, help="folder for saved frames (default data/samples/<date-time>)"
+    )
+    parser.add_argument(
+        "--every", type=int, default=1, help="while recording, keep 1 frame out of N (1)"
+    )
     args = parser.parse_args()
 
     out_dir = args.out or REPO_ROOT / "data" / "samples" / datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -237,11 +295,16 @@ def main() -> None:
                 latest = receiver.latest
             if latest is not None and latest[2] != shown_at:
                 image, captured_ms, shown_at = latest
-                fps, frames = receiver.stats()
+                fps, _ = receiver.stats()
                 latency_ms = shown_at * 1000 - captured_ms
                 h, w = image.shape[:2]
                 view = image.copy()
-                draw_label(view, f"{w}x{h}  {fps:.1f} fps  latency {latency_ms:.0f} ms", (10, 30), (0, 255, 0))
+                draw_label(
+                    view,
+                    f"{w}x{h}  {fps:.1f} fps  latency {latency_ms:.0f} ms",
+                    (10, 30),
+                    (0, 255, 0),
+                )
                 if recorder.recording:
                     draw_label(view, f"REC {recorder.saved}", (10, 60), (0, 0, 255))
                 cv2.imshow(window, view)
