@@ -278,6 +278,9 @@ def main() -> None:
     parser.add_argument(
         "--every", type=int, default=1, help="while recording, keep 1 frame out of N (1)"
     )
+    parser.add_argument(
+        "--max-height", type=int, default=760, help="preview height limit in pixels (760)"
+    )
     args = parser.parse_args()
 
     out_dir = args.out or REPO_ROOT / "data" / "samples" / datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -298,7 +301,10 @@ def main() -> None:
                 fps, _ = receiver.stats()
                 latency_ms = shown_at * 1000 - captured_ms
                 h, w = image.shape[:2]
-                view = image.copy()
+                # Shrink the preview to fit the screen (720x1280 is taller than most laptop
+                # screens). Saved frames keep the full resolution.
+                scale = min(1.0, args.max_height / h)
+                view = cv2.resize(image, None, fx=scale, fy=scale) if scale < 1 else image.copy()
                 draw_label(
                     view,
                     f"{w}x{h}  {fps:.1f} fps  latency {latency_ms:.0f} ms",
