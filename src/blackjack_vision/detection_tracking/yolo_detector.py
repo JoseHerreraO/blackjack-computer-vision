@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -79,44 +80,110 @@ def non_max_suppression(detections: Sequence[Detection], iou_threshold: float) -
     return kept
 
 
-def merge_corners(detections: Sequence[Detection], link_factor: float = 6.0) -> list[Detection]:
-    """Join the two corner boxes of the same card into one detection.
+# Distance between the two corner indices of one card divided by the corner box diagonal.
+# Measured on real glasses footage (360x640 upscaled 2x): median 2.4, 10-90 % range 2.2-3.3.
+CORNER_DISTANCE_RATIO = 2.6
+CORNER_DISTANCE_TOLERANCE = 1.8
+MAX_EXACT_MATCHING = 14
 
-    Two boxes are joined when they have the same label and their centres are closer than
-    ``link_factor`` times the larger box diagonal (a card is about 5-6 corner indices tall).
-    The merged box spans both corners, so it covers most of the card, and keeps the best score.
-    Groups are built transitively, so three boxes of one card also end up together.
+
+def merge_corners(
+    detections: Sequence[Detection],
+    expected_ratio: float = CORNER_DISTANCE_RATIO,
+    tolerance: float = CORNER_DISTANCE_TOLERANCE,
+) -> list[Detection]:
+    """Join the two corner boxes of each card into one detection.
+
+    The model boxes the corner index of a card, so a card shows up as up to two boxes with the
+    same label, at opposite corners and about ``expected_ratio`` corner-box diagonals apart.
+    Boxes are paired **two by two**: an optimal matching among the boxes of each label, where a
+    pair costs ``|distance / diagonal - expected_ratio| / tolerance`` (pairs costing more than 1
+    are not allowed) and a box left alone costs 1. Each box is used at most once, so two cards
+    with the same value lying next to each other (several decks in the shoe) stay two cards.
+
+    A paired detection spans both corners, so its box covers most of the card. A box without a
+    partner (the other corner hidden or missed) is kept as a one-corner card.
     """
-    remaining = list(detections)
+    by_label: dict[str, list[Detection]] = {}
+    for detection in detections:
+        by_label.setdefault(detection.label, []).append(detection)
+
     merged: list[Detection] = []
-    while remaining:
-        group = [remaining.pop(0)]
-        changed = True
-        while changed:
-            changed = False
-            for candidate in list(remaining):
-                if candidate.label != group[0].label:
-                    continue
-                if any(_close(candidate, member, link_factor) for member in group):
-                    group.append(candidate)
-                    remaining.remove(candidate)
-                    changed = True
-        boxes = np.array([d.box for d in group])
-        merged.append(
-            Detection(
-                box=np.concatenate([boxes[:, :2].min(axis=0), boxes[:, 2:].max(axis=0)]),
-                label=group[0].label,
-                confidence=max(d.confidence for d in group),
-                parts=sum(d.parts for d in group),
+    for group in by_label.values():
+        cost = _pair_costs(group, expected_ratio, tolerance)
+        for pair in _match_pairs(cost):
+            members = [group[i] for i in pair]
+            boxes = np.array([d.box for d in members])
+            merged.append(
+                Detection(
+                    box=np.concatenate([boxes[:, :2].min(axis=0), boxes[:, 2:].max(axis=0)]),
+                    label=members[0].label,
+                    confidence=max(d.confidence for d in members),
+                    parts=sum(d.parts for d in members),
+                )
             )
-        )
     return merged
 
 
-def _close(a: Detection, b: Detection, link_factor: float) -> bool:
-    diagonal = max(float(np.hypot(*a.size)), float(np.hypot(*b.size)))
-    distance = float(np.hypot(a.center[0] - b.center[0], a.center[1] - b.center[1]))
-    return distance <= link_factor * diagonal
+def _pair_costs(group: Sequence[Detection], expected_ratio: float, tolerance: float) -> np.ndarray:
+    """Symmetric pairing cost matrix, ``inf`` where two boxes cannot be the same card."""
+    n = len(group)
+    cost = np.full((n, n), np.inf)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = group[i], group[j]
+            diagonal = (np.hypot(*a.size) + np.hypot(*b.size)) / 2.0
+            if diagonal <= 0:
+                continue
+            distance = np.hypot(a.center[0] - b.center[0], a.center[1] - b.center[1])
+            value = abs(distance / diagonal - expected_ratio) / tolerance
+            if value <= 1.0:
+                cost[i, j] = cost[j, i] = value
+    return cost
+
+
+def _match_pairs(cost: np.ndarray) -> list[tuple[int, ...]]:
+    """Minimum-cost matching where every index is paired once or left alone (cost 1).
+
+    This is a matching on a general graph (any box may pair with any other), not a bipartite
+    one, so it is solved exactly with dynamic programming over subsets. A label rarely has more
+    than a handful of boxes; above ``MAX_EXACT_MATCHING`` it falls back to greedy pairing.
+    """
+    n = len(cost)
+    if n > MAX_EXACT_MATCHING:
+        return _greedy_pairs(cost)
+
+    @cache
+    def best(mask: int) -> tuple[float, tuple[tuple[int, ...], ...]]:
+        if mask == (1 << n) - 1:
+            return 0.0, ()
+        i = next(k for k in range(n) if not mask & (1 << k))
+        alone_cost, alone_pairs = best(mask | (1 << i))
+        result = (alone_cost + 1.0, ((i,), *alone_pairs))
+        for j in range(i + 1, n):
+            if mask & (1 << j) or not np.isfinite(cost[i, j]):
+                continue
+            rest_cost, rest_pairs = best(mask | (1 << i) | (1 << j))
+            if rest_cost + cost[i, j] < result[0]:
+                result = (rest_cost + float(cost[i, j]), ((i, j), *rest_pairs))
+        return result
+
+    return list(best(0)[1])
+
+
+def _greedy_pairs(cost: np.ndarray) -> list[tuple[int, ...]]:
+    n = len(cost)
+    order = sorted(
+        (cost[i, j], i, j) for i in range(n) for j in range(i + 1, n) if np.isfinite(cost[i, j])
+    )
+    used: set[int] = set()
+    pairs: list[tuple[int, ...]] = []
+    for _, i, j in order:
+        if i not in used and j not in used:
+            used.update((i, j))
+            pairs.append((i, j))
+    pairs.extend((i,) for i in range(n) if i not in used)
+    return pairs
 
 
 def tile_grid(

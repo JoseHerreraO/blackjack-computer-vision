@@ -7,7 +7,10 @@ ID across frames:
 1. Each track predicts where its card is now with a constant-velocity Kalman filter
    (``cv2.KalmanFilter``) on the box centre and size.
 2. Predicted boxes and new detections are matched with the Hungarian algorithm
-   (``scipy.optimize.linear_sum_assignment``) on ``1 - IoU``.
+   (``scipy.optimize.linear_sum_assignment``) on ``1 - IoU``. What is left is matched a second
+   time by label and centre distance, so a card keeps its ID when a head turn moves it further
+   than its own size between two detections (the glasses are on the head and YOLO runs at only
+   a few fps on a CPU), instead of being counted again.
 3. Matched tracks are corrected with their detection. Unmatched detections start new tracks and
    tracks that stay unmatched for ``max_missed`` frames are dropped, so a card hidden for a
    moment by a hand keeps its ID when it shows up again.
@@ -144,6 +147,8 @@ class CardTracker:
 
     Args:
         min_iou: Minimum IoU between a predicted box and a detection to match them.
+        max_center_distance: Second matching pass for tracks and detections with the same
+            label: maximum distance between centres, in diagonals of the track's box.
         min_hits: Detections needed before a track is confirmed.
         max_missed: Consecutive frames a track may go unmatched before it is dropped.
         label_window: Detections that vote for the label of a track.
@@ -155,6 +160,7 @@ class CardTracker:
         self,
         *,
         min_iou: float = 0.2,
+        max_center_distance: float = 2.0,
         min_hits: int = 3,
         max_missed: int = 10,
         label_window: int = 15,
@@ -162,6 +168,7 @@ class CardTracker:
         measurement_noise: float = 4.0,
     ) -> None:
         self.min_iou = min_iou
+        self.max_center_distance = max_center_distance
         self.min_hits = min_hits
         self.max_missed = max_missed
         self.label_window = label_window
@@ -214,11 +221,35 @@ class CardTracker:
             return [], list(range(n_tracks)), list(range(n_detections))
         iou = box_iou(predicted, np.array([d.box for d in detections]))
         rows, cols = linear_sum_assignment(1.0 - iou)
-        matches = [(r, c) for r, c in zip(rows, cols) if iou[r, c] >= self.min_iou]
+        matches = [(int(r), int(c)) for r, c in zip(rows, cols) if iou[r, c] >= self.min_iou]
+
+        # Second pass: same label and close centres, for jumps too big to overlap.
+        left_tracks = [i for i in range(n_tracks) if i not in {r for r, _ in matches}]
+        left_detections = [j for j in range(n_detections) if j not in {c for _, c in matches}]
+        if left_tracks and left_detections and self.max_center_distance > 0:
+            cost = np.full((len(left_tracks), len(left_detections)), np.inf)
+            for a, i in enumerate(left_tracks):
+                box = predicted[i]
+                center = (box[:2] + box[2:]) / 2.0
+                diagonal = float(np.hypot(*(box[2:] - box[:2])))
+                for b, j in enumerate(left_detections):
+                    if detections[j].label != self.tracks[i].label:
+                        continue
+                    distance = float(np.hypot(*(np.array(detections[j].center) - center)))
+                    if distance <= self.max_center_distance * diagonal:
+                        cost[a, b] = distance
+            if np.isfinite(cost).any():
+                rows, cols = linear_sum_assignment(np.where(np.isfinite(cost), cost, 1e12))
+                matches += [
+                    (left_tracks[r], left_detections[c])
+                    for r, c in zip(rows, cols)
+                    if np.isfinite(cost[r, c])
+                ]
+
         matched_tracks = {r for r, _ in matches}
         matched_detections = {c for _, c in matches}
         return (
-            [(int(r), int(c)) for r, c in matches],
+            matches,
             [i for i in range(n_tracks) if i not in matched_tracks],
             [j for j in range(n_detections) if j not in matched_detections],
         )

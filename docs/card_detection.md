@@ -16,7 +16,9 @@ pip install -e ".[yolo]"
 python scripts/download_card_model.py
 ```
 
-The weights go to `models/lgd-cards-gen3/` and are not versioned (AGPL-3.0, 19 MB).
+The weights go to `models/lgd-cards-gen3/` and are not versioned (AGPL-3.0, 19 MB). The script
+downloads a pinned commit of the model repo and checks the SHA-256 of `best.pt`, because a `.pt`
+is a pickle that runs code when it is loaded.
 
 ## 2. The pretrained model
 
@@ -27,8 +29,12 @@ plus two days of real table video. It has 52 classes named like `10H`, `AS` or `
 (rank + `C`/`D`/`H`/`S`).
 
 The model boxes the **corner index** of a card (the small rank and suit), not the whole card, so
-a card usually gives two boxes with the same label. `merge_corners` joins boxes with the same
-label that are close together into one detection per card. Its reported recall is 0.85 on its
+a card usually gives two boxes with the same label. `merge_corners` pairs them **two by two**
+with an optimal matching among the boxes of each label: two boxes can be one card when their
+distance is about 2.6 corner-box diagonals (median 2.4 on our footage), each box is used once,
+and a box without a partner stays a one-corner card. Two cards with the same value next to each
+other (several decks in the shoe) therefore stay two cards.
+Its reported recall is 0.85 on its
 authors' own casino video, so it has to be measured on our glasses stream before trusting it.
 
 ## 3. Running it
@@ -72,7 +78,9 @@ fine-tune a smaller YOLO11n.
 
 - one `cv2.KalmanFilter` per card, state `[cx, cy, w, h, vx, vy]` (constant velocity);
 - Hungarian matching (`scipy.optimize.linear_sum_assignment`) on `1 - IoU` between predicted
-  boxes and detections, with `min_iou = 0.2`;
+  boxes and detections, with `min_iou = 0.2`, then a second pass for what is left that matches
+  the same label within `max_center_distance = 2` box diagonals, so a head turn that moves a card
+  further than its size between two detections does not create a new track (and a new count);
 - a track is confirmed after `min_hits = 3` detections and dropped after `max_missed = 10`
   frames without one (about 0.7 s at 15 fps), so a card hidden by a hand keeps its ID;
 - the label is a confidence-weighted vote over the last 15 detections.

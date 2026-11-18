@@ -41,6 +41,35 @@ def test_merge_corners_joins_both_corners_of_a_card():
     assert by_label["7C"].parts == 1
 
 
+def test_merge_corners_keeps_two_equal_cards_apart():
+    # Review of PR #17: two 10H side by side (several decks) must stay two cards.
+    cards = [
+        det(100, 100, label="10H"),
+        det(200, 260, label="10H"),  # first 10H, both corners
+        det(300, 100, label="10H"),
+        det(400, 260, label="10H"),  # second 10H next to it
+    ]
+    merged = merge_corners(cards)
+    assert len(merged) == 2
+    assert sorted(d.box.tolist() for d in merged) == [[100, 100, 220, 300], [300, 100, 420, 300]]
+    assert all(d.parts == 2 for d in merged)
+
+
+def test_merge_corners_equal_cards_touching_on_real_geometry():
+    # Corner boxes about 2.4 diagonals apart, as measured on the glasses stream, and two equal
+    # cards whose facing corners are closer to each other than to their own partners' ideal.
+    w, h = 20, 40  # corner box, diagonal ~44.7, partner ~107 px away
+    a1, a2 = det(0, 0, w, h, "8S"), det(50, 95, w, h, "8S")
+    b1, b2 = det(75, 0, w, h, "8S"), det(125, 95, w, h, "8S")
+    merged = merge_corners([a2, b1, b2, a1])
+    assert len(merged) == 2 and all(d.parts == 2 for d in merged)
+
+
+def test_merge_corners_single_corner_stays_a_card():
+    merged = merge_corners([det(100, 100, label="QD")])
+    assert len(merged) == 1 and merged[0].parts == 1
+
+
 def test_merge_corners_keeps_far_cards_with_the_same_label_apart():
     # Two decks in the shoe: two aces of hearts on opposite sides of the table.
     assert len(merge_corners([det(0, 0), det(1000, 1000)])) == 2
@@ -114,6 +143,24 @@ def test_track_is_dropped_after_max_missed():
     for _ in range(3):
         removed += tracker.update([]).removed
     assert tracker.tracks == [] and [t.track_id for t in removed] == [1]
+
+
+def test_head_turn_jump_keeps_the_same_id():
+    # The glasses move with the head: between two detections a card jumps further than its
+    # own size (no overlap), but it is the same card and must not be counted again.
+    tracker = CardTracker(min_hits=2)
+    for _ in range(3):
+        tracker.update([det(100, 100, label="KH")])
+    update = tracker.update([det(150, 130, label="KH")])
+    assert [t.track_id for t in update.tracks] == [1]
+    assert update.confirmed == []
+
+
+def test_jump_to_a_different_label_starts_a_new_track():
+    tracker = CardTracker(min_hits=1)
+    tracker.update([det(100, 100, label="KH")])
+    update = tracker.update([det(150, 130, label="5C")])
+    assert sorted(t.track_id for t in update.tracks) == [1, 2]
 
 
 def test_label_vote_ignores_a_single_misread():
