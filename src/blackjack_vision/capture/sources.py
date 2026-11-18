@@ -317,12 +317,14 @@ class SourceKind(str, Enum):
     VIDEO = "video"
     STREAM = "stream"
     IMAGES = "images"
+    BRIDGE = "bridge"
 
 
 def parse_source_spec(spec: int | str | Path) -> tuple[SourceKind, int | str]:
     """Classify a command-line source specification without opening it.
 
     * ``0`` or ``"1"``: camera index.
+    * ``"bridge"`` or ``"bridge:5050"``: live glasses stream from the BJ Bridge iOS app.
     * ``"http://..."``, ``"rtsp://..."``...: network stream.
     * An existing folder, a glob pattern (``*``, ``?``, ``[``) or an image file: image sequence.
     * Anything else (``clip.mp4``): video file.
@@ -335,6 +337,11 @@ def parse_source_spec(spec: int | str | Path) -> tuple[SourceKind, int | str]:
     text = str(spec).strip()
     if text.isdigit():
         return SourceKind.CAMERA, int(text)
+    if text.lower() == "bridge" or text.lower().startswith("bridge:"):
+        port = text.partition(":")[2] or "5050"
+        if not port.isdigit():
+            raise ValueError(f"Invalid bridge port in {text!r}, use e.g. bridge:5050")
+        return SourceKind.BRIDGE, int(port)
     if text.lower().startswith(STREAM_PREFIXES):
         return SourceKind.STREAM, text
     path = Path(text)
@@ -354,7 +361,8 @@ def open_source(
     """Open any supported source from a single specification (see :func:`parse_source_spec`).
 
     Args:
-        spec: Camera index, video file, image folder, glob pattern, image file or stream URL.
+        spec: Camera index, video file, image folder, glob pattern, image file, stream URL or
+            ``bridge[:port]`` for the glasses stream sent by the iOS app.
         width: Requested camera width (cameras only).
         height: Requested camera height (cameras only).
         fps: Requested camera frame rate, or the nominal rate of an image sequence.
@@ -368,6 +376,10 @@ def open_source(
         return VideoCaptureSource(int(value), width=width, height=height, fps=fps, live=True)
     if kind is SourceKind.STREAM:
         return VideoCaptureSource(str(value), live=True)
+    if kind is SourceKind.BRIDGE:
+        from blackjack_vision.capture.bridge import BridgeSource  # imports this module
+
+        return BridgeSource(port=int(value))
     path = Path(str(value))
     if kind is SourceKind.IMAGES:
         rate = fps or 1.0
