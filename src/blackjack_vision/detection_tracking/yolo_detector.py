@@ -1,0 +1,282 @@
+"""Playing-card detection with a YOLO model (Ultralytics).
+
+The default weights are ``lgd-cards-gen3`` (YOLO11s, 52 classes ``"10H"``, ``"AS"``, ``"KD"``...),
+see ``scripts/download_card_model.py``. That model was trained on the *corner index* of each
+card (the small rank and suit printed in two opposite corners), not on the whole card, so one
+card usually yields two boxes with the same label. :func:`merge_corners` joins them into one
+detection per card.
+
+The glasses stream is a tall 720x1280 frame and the model runs at 640 px, so the frame is split
+into overlapping tiles (one column and two rows by default). Each tile is close to the model's
+native size, which keeps the small corner indices readable.
+
+``ultralytics`` is an optional dependency (``pip install -e ".[yolo]"``) and is only imported when
+a :class:`YoloCardDetector` is created, so the rest of the package works without it.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from functools import cache
+from pathlib import Path
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_WEIGHTS = Path("models/lgd-cards-gen3/best.pt")
+
+
+@dataclass(frozen=True)
+class Detection:
+    """One detected box in image coordinates.
+
+    Attributes:
+        box: ``(x1, y1, x2, y2)`` in pixels, float.
+        label: Card code as the model names it, e.g. ``"10H"`` or ``"QS"``.
+        confidence: Detector score in ``[0, 1]``.
+        parts: Number of model boxes merged into this one (2 when both corners were seen).
+    """
+
+    box: np.ndarray = field(repr=False)
+    label: str
+    confidence: float
+    parts: int = 1
+
+    @property
+    def center(self) -> tuple[float, float]:
+        x1, y1, x2, y2 = self.box
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    @property
+    def size(self) -> tuple[float, float]:
+        x1, y1, x2, y2 = self.box
+        return x2 - x1, y2 - y1
+
+
+def box_iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Pairwise IoU between ``(N, 4)`` and ``(M, 4)`` boxes in ``x1, y1, x2, y2`` format."""
+    a = np.asarray(a, dtype=float).reshape(-1, 4)
+    b = np.asarray(b, dtype=float).reshape(-1, 4)
+    top_left = np.maximum(a[:, None, :2], b[None, :, :2])
+    bottom_right = np.minimum(a[:, None, 2:], b[None, :, 2:])
+    intersection = np.prod(np.clip(bottom_right - top_left, 0, None), axis=2)
+    area_a = np.prod(a[:, 2:] - a[:, :2], axis=1)
+    area_b = np.prod(b[:, 2:] - b[:, :2], axis=1)
+    union = area_a[:, None] + area_b[None, :] - intersection
+    return np.where(union > 0, intersection / np.maximum(union, 1e-9), 0.0)
+
+
+def non_max_suppression(detections: Sequence[Detection], iou_threshold: float) -> list[Detection]:
+    """Per-label NMS, used to remove duplicates where tiles overlap."""
+    kept: list[Detection] = []
+    for detection in sorted(detections, key=lambda d: d.confidence, reverse=True):
+        same_label = [k.box for k in kept if k.label == detection.label]
+        if same_label and box_iou(detection.box, np.array(same_label)).max() > iou_threshold:
+            continue
+        kept.append(detection)
+    return kept
+
+
+# Distance between the two corner indices of one card divided by the corner box diagonal.
+# Measured on real glasses footage (360x640 upscaled 2x): median 2.4, 10-90 % range 2.2-3.3.
+CORNER_DISTANCE_RATIO = 2.6
+CORNER_DISTANCE_TOLERANCE = 1.8
+MAX_EXACT_MATCHING = 14
+
+
+def merge_corners(
+    detections: Sequence[Detection],
+    expected_ratio: float = CORNER_DISTANCE_RATIO,
+    tolerance: float = CORNER_DISTANCE_TOLERANCE,
+) -> list[Detection]:
+    """Join the two corner boxes of each card into one detection.
+
+    The model boxes the corner index of a card, so a card shows up as up to two boxes with the
+    same label, at opposite corners and about ``expected_ratio`` corner-box diagonals apart.
+    Boxes are paired **two by two**: an optimal matching among the boxes of each label, where a
+    pair costs ``|distance / diagonal - expected_ratio| / tolerance`` (pairs costing more than 1
+    are not allowed) and a box left alone costs 1. Each box is used at most once, so two cards
+    with the same value lying next to each other (several decks in the shoe) stay two cards.
+
+    A paired detection spans both corners, so its box covers most of the card. A box without a
+    partner (the other corner hidden or missed) is kept as a one-corner card.
+    """
+    by_label: dict[str, list[Detection]] = {}
+    for detection in detections:
+        by_label.setdefault(detection.label, []).append(detection)
+
+    merged: list[Detection] = []
+    for group in by_label.values():
+        cost = _pair_costs(group, expected_ratio, tolerance)
+        for pair in _match_pairs(cost):
+            members = [group[i] for i in pair]
+            boxes = np.array([d.box for d in members])
+            merged.append(
+                Detection(
+                    box=np.concatenate([boxes[:, :2].min(axis=0), boxes[:, 2:].max(axis=0)]),
+                    label=members[0].label,
+                    confidence=max(d.confidence for d in members),
+                    parts=sum(d.parts for d in members),
+                )
+            )
+    return merged
+
+
+def _pair_costs(group: Sequence[Detection], expected_ratio: float, tolerance: float) -> np.ndarray:
+    """Symmetric pairing cost matrix, ``inf`` where two boxes cannot be the same card."""
+    n = len(group)
+    cost = np.full((n, n), np.inf)
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = group[i], group[j]
+            diagonal = (np.hypot(*a.size) + np.hypot(*b.size)) / 2.0
+            if diagonal <= 0:
+                continue
+            distance = np.hypot(a.center[0] - b.center[0], a.center[1] - b.center[1])
+            value = abs(distance / diagonal - expected_ratio) / tolerance
+            if value <= 1.0:
+                cost[i, j] = cost[j, i] = value
+    return cost
+
+
+def _match_pairs(cost: np.ndarray) -> list[tuple[int, ...]]:
+    """Minimum-cost matching where every index is paired once or left alone (cost 1).
+
+    This is a matching on a general graph (any box may pair with any other), not a bipartite
+    one, so it is solved exactly with dynamic programming over subsets. A label rarely has more
+    than a handful of boxes; above ``MAX_EXACT_MATCHING`` it falls back to greedy pairing.
+    """
+    n = len(cost)
+    if n > MAX_EXACT_MATCHING:
+        return _greedy_pairs(cost)
+
+    @cache
+    def best(mask: int) -> tuple[float, tuple[tuple[int, ...], ...]]:
+        if mask == (1 << n) - 1:
+            return 0.0, ()
+        i = next(k for k in range(n) if not mask & (1 << k))
+        alone_cost, alone_pairs = best(mask | (1 << i))
+        result = (alone_cost + 1.0, ((i,), *alone_pairs))
+        for j in range(i + 1, n):
+            if mask & (1 << j) or not np.isfinite(cost[i, j]):
+                continue
+            rest_cost, rest_pairs = best(mask | (1 << i) | (1 << j))
+            if rest_cost + cost[i, j] < result[0]:
+                result = (rest_cost + float(cost[i, j]), ((i, j), *rest_pairs))
+        return result
+
+    return list(best(0)[1])
+
+
+def _greedy_pairs(cost: np.ndarray) -> list[tuple[int, ...]]:
+    n = len(cost)
+    order = sorted(
+        (cost[i, j], i, j) for i in range(n) for j in range(i + 1, n) if np.isfinite(cost[i, j])
+    )
+    used: set[int] = set()
+    pairs: list[tuple[int, ...]] = []
+    for _, i, j in order:
+        if i not in used and j not in used:
+            used.update((i, j))
+            pairs.append((i, j))
+    pairs.extend((i,) for i in range(n) if i not in used)
+    return pairs
+
+
+def tile_grid(
+    width: int, height: int, columns: int, rows: int, overlap: float
+) -> list[tuple[int, int, int, int]]:
+    """Overlapping tiles ``(x, y, w, h)`` that cover a ``width x height`` image."""
+    if columns < 1 or rows < 1:
+        raise ValueError("columns and rows must be at least 1")
+    if not 0.0 <= overlap < 1.0:
+        raise ValueError(f"overlap must be in [0, 1), got {overlap}")
+
+    def spans(length: int, count: int) -> list[tuple[int, int]]:
+        if count == 1:
+            return [(0, length)]
+        size = int(np.ceil(length / (count - (count - 1) * overlap)))
+        step = (length - size) / (count - 1)
+        return [(round(i * step), size) for i in range(count)]
+
+    return [(x, y, w, h) for y, h in spans(height, rows) for x, w in spans(width, columns)]
+
+
+class YoloCardDetector:
+    """YOLO card detector with tiling and corner merging.
+
+    Args:
+        weights: Ultralytics ``.pt`` (or exported) model file.
+        confidence: Minimum detection score.
+        iou: IoU threshold of the model's own NMS and of the cross-tile NMS.
+        image_size: Inference size passed to YOLO.
+        tiles: ``(columns, rows)`` grid. ``(1, 1)`` runs on the whole frame.
+        overlap: Fraction of each tile shared with its neighbour, so no corner index is cut.
+        merge: Join the two corners of each card (see :func:`merge_corners`).
+        device: ``"cpu"``, ``"cuda:0"``... ``None`` lets Ultralytics choose.
+    """
+
+    def __init__(
+        self,
+        weights: str | Path = DEFAULT_WEIGHTS,
+        *,
+        confidence: float = 0.4,
+        iou: float = 0.5,
+        image_size: int = 640,
+        tiles: tuple[int, int] = (1, 2),
+        overlap: float = 0.15,
+        merge: bool = True,
+        device: str | None = None,
+    ) -> None:
+        weights = Path(weights)
+        if not weights.is_file():
+            raise FileNotFoundError(
+                f"Card model not found: {weights}. Run scripts/download_card_model.py first."
+            )
+        try:
+            from ultralytics import YOLO
+        except ImportError as error:  # pragma: no cover - depends on the environment
+            raise ImportError(
+                'YoloCardDetector needs ultralytics: pip install -e ".[yolo]"'
+            ) from error
+
+        self.model = YOLO(str(weights))
+        self.names: dict[int, str] = dict(self.model.names)
+        self.confidence = confidence
+        self.iou = iou
+        self.image_size = image_size
+        self.tiles = tiles
+        self.overlap = overlap
+        self.merge = merge
+        self.device = device
+        logger.info("Loaded %s with %d classes", weights, len(self.names))
+
+    def detect(self, image: np.ndarray) -> list[Detection]:
+        """Cards in a BGR image, one detection per card when ``merge`` is on."""
+        height, width = image.shape[:2]
+        grid = tile_grid(width, height, *self.tiles, self.overlap)
+        crops = [image[y : y + h, x : x + w] for x, y, w, h in grid]
+        results = self.model.predict(
+            crops,
+            conf=self.confidence,
+            iou=self.iou,
+            imgsz=self.image_size,
+            device=self.device,
+            verbose=False,
+        )
+
+        detections: list[Detection] = []
+        for (x, y, _, _), result in zip(grid, results):
+            boxes = result.boxes
+            if boxes is None or len(boxes) == 0:
+                continue
+            xyxy = boxes.xyxy.cpu().numpy() + np.array([x, y, x, y], dtype=float)
+            for box, cls, score in zip(xyxy, boxes.cls.cpu().numpy(), boxes.conf.cpu().numpy()):
+                detections.append(Detection(box, self.names[int(cls)], float(score)))
+
+        if len(grid) > 1:
+            detections = non_max_suppression(detections, self.iou)
+        return merge_corners(detections) if self.merge else detections
