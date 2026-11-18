@@ -1,0 +1,88 @@
+# XcodeGen spec for the iOS bridge app (glasses -> iPhone -> PC).
+# The .xcodeproj and Info.plist are generated from this file in CI and are not versioned:
+#   cd mobile/ios && xcodegen generate
+
+name: BlackjackBridge
+
+options:
+  bundleIdPrefix: es.icai.blackjackvision
+  deploymentTarget:
+    iOS: "17.2" # minimum supported by the Meta Wearables DAT SDK
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1" # iPhone only
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: "" # signed later by Sideloadly with a free Apple ID
+
+packages:
+  MWDAT:
+    url: https://github.com/facebook/meta-wearables-dat-ios
+    exactVersion: "1.0.1"
+
+targets:
+  BlackjackBridge:
+    type: application
+    platform: iOS
+    sources:
+      - path: BlackjackBridge
+    dependencies:
+      - package: MWDAT
+        product: MWDATCore
+      - package: MWDAT
+        product: MWDATCamera
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: es.icai.blackjackvision.bridge
+    scheme: {}
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: BJ Bridge
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIRequiredDeviceCapabilities: [arm64]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+
+        # URL scheme so Meta AI can call the app back after registration and permission
+        # requests. Must match MWDAT > AppLinkURLScheme.
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
+            CFBundleURLSchemes: [blackjackbridge]
+
+        # Meta Wearables DAT. With Developer Mode on in Meta AI, MetaAppID and ClientToken
+        # stay as unexpanded placeholders and the SDK skips attestation.
+        MWDAT:
+          AppLinkURLScheme: blackjackbridge://
+          MetaAppID: $(META_APP_ID)
+          ClientToken: $(CLIENT_TOKEN)
+          TeamID: $(DEVELOPMENT_TEAM)
+          Analytics:
+            OptOut: true
+
+        # Links the SDK uses to reach the glasses (see the DAT getting-started guide):
+        # Bluetooth LE for the session, Bluetooth Classic for the camera stream and
+        # Wi-Fi for high bandwidth. Without external-accessory and the accessory
+        # protocol the preview fails with "device not connected".
+        UIBackgroundModes:
+          - processing
+          - bluetooth-central
+          - bluetooth-peripheral
+          - external-accessory
+        UISupportedExternalAccessoryProtocols: [com.meta.ar.wearable]
+        NSBluetoothAlwaysUsageDescription: Needed to connect to your Meta AI glasses.
+        NSBluetoothPeripheralUsageDescription: Needed to connect to your Meta AI glasses.
+
+        # Local network: the TCP connection to the PC receiver and the glasses' Wi-Fi link.
+        # Without this description iOS blocks the connection to the PC.
+        NSLocalNetworkUsageDescription: >-
+          Sends the glasses' video to the Blackjack assistant running on your PC and
+          connects to your glasses over Wi-Fi.
+        NSBonjourServices: [_bonjour._tcp]
