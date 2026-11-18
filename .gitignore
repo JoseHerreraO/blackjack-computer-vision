@@ -226,6 +226,9 @@ data/samples/*
 *.avi
 outputs/
 
+# Downloaded detector weights (scripts/download_card_model.py), AGPL-3.0, not versioned
+models/
+
 # Calibration captures (only the JSON camera models are versioned)
 data/calibration/**
 !data/calibration/.gitkeep
