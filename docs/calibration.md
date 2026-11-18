@@ -46,6 +46,15 @@ shifts the corners):
 
 ## 4. Running the calibration
 
+**Step by step (notebook).** `notebooks/01_calibracion_camara.ipynb` follows the same steps as Lab 2
+(load, `findChessboardCorners`, `cornerSubPix`, `drawChessboardCorners`, 3D board points,
+`calibrateCamera`, the lab questions and undistortion) on our own photos, adds the quality checks
+of section 5 and saves the figures for the report in `outputs/calibration/<name>/`. Put the photos
+in `data/calibration/fotos/`, set the parameters in its first cells and run it
+(`pip install -e ".[notebooks]"` installs Jupyter's kernel and matplotlib).
+
+**Command line.**
+
 ```bash
 # From a video (1 frame out of 5 is analysed; near-duplicate views are skipped)
 python scripts/calibrate.py --source data/calibration/glasses_high.mp4 --pattern 9x6 \
