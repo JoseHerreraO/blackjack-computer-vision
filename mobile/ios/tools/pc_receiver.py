@@ -2,15 +2,24 @@
 
 A minimal PC-side TCP server for checking the iPhone app without the full pipeline.
 It shows the glasses' frames in a window with the receive rate and latency, prints
-HELLO and LOG messages, and sends commands typed in the terminal back to the iPhone.
+HELLO and LOG messages, sends commands typed in the terminal back to the iPhone and
+saves frames to disk for calibration and for building the card dataset.
 
-    python mobile/ios/tools/pc_receiver.py [--port 5050]
+    python mobile/ios/tools/pc_receiver.py [--port 5050] [--out DIR] [--every N]
+
+Keys (with the video window focused):
+    s   save the current frame
+    r   start or stop recording every N-th frame (all of them by default)
+    q   quit
+
+Frames are saved as the JPEG bytes received from the iPhone, without re-encoding, named
+<sequence>_<capture ms>.jpg. They go to --out, by default data/samples/<date-time>/, which
+git ignores. For the glasses calibration record into data/calibration/glasses_high/ and
+pass that folder to scripts/calibrate.py.
 
 Terminal commands (sent as COMMAND messages):
     say <text>      {"type": "say", "text": ..., "lang": "es-ES"}
     status <text>   {"type": "status", "text": ...}
-
-Press q in the video window or Ctrl+C in the terminal to quit.
 
 Wire format (see mobile/ios/BlackjackBridge/Networking/BridgeProtocol.swift):
 [1 byte type][uint32 BE length][payload]. 0x01 HELLO (JSON), 0x02 FRAME (int64 BE
@@ -27,6 +36,8 @@ import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -34,10 +45,56 @@ import numpy as np
 HELLO, FRAME, LOG, COMMAND = 0x01, 0x02, 0x03, 0x10
 HEADER = struct.Struct(">BI")
 MAX_PAYLOAD = 16 * 1024 * 1024
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+class Recorder:
+    """Writes received JPEG frames to a folder, untouched."""
+
+    def __init__(self, out_dir: Path, every: int) -> None:
+        self.out_dir = out_dir
+        self.every = max(1, every)
+        self.recording = False
+        self.saved = 0
+        self._seen = 0
+        self._sequence = 0
+        self._snapshot_requested = False
+        self._lock = threading.Lock()
+
+    def toggle(self) -> None:
+        with self._lock:
+            self.recording = not self.recording
+            self._seen = 0
+            state = "started" if self.recording else "stopped"
+        print(f"Recording {state} ({self.saved} frames saved in {self.out_dir})")
+
+    def request_snapshot(self) -> None:
+        with self._lock:
+            self._snapshot_requested = True
+
+    def offer(self, jpeg: bytes, captured_ms: int) -> None:
+        """Called for every received frame (network thread)."""
+        with self._lock:
+            take = self._snapshot_requested
+            self._snapshot_requested = False
+            if self.recording:
+                take = take or self._seen % self.every == 0
+                self._seen += 1
+            if not take:
+                return
+            self._sequence += 1
+            name = f"{self._sequence:05d}_{captured_ms}.jpg"
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        (self.out_dir / name).write_bytes(jpeg)
+        with self._lock:
+            self.saved += 1
+            if not self.recording:
+                print(f"Saved {self.out_dir / name}")
 
 
 class Receiver:
-    def __init__(self) -> None:
+    def __init__(self, recorder: Recorder) -> None:
+        self.recorder = recorder
         self.lock = threading.Lock()
         self.client: socket.socket | None = None
         self.latest: tuple[np.ndarray, int, float] | None = None  # image, capture ms, arrival
@@ -85,7 +142,7 @@ class Receiver:
         while True:
             kind, length = HEADER.unpack(read_exact(client, HEADER.size))
             if length > MAX_PAYLOAD:
-                raise ConnectionError(f"message too large ({length} bytes)")
+                raise ConnectionError(f"message too large ({length} bytes), is this the BJ Bridge app?")
             payload = read_exact(client, length)
             if kind == HELLO:
                 self.hello = json.loads(payload)
@@ -99,10 +156,12 @@ class Receiver:
 
     def handle_frame(self, payload: bytes) -> None:
         (captured_ms,) = struct.unpack(">q", payload[:8])
-        image = cv2.imdecode(np.frombuffer(payload[8:], np.uint8), cv2.IMREAD_COLOR)
+        jpeg = payload[8:]
+        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             print("! Could not decode a JPEG frame")
             return
+        self.recorder.offer(jpeg, captured_ms)
         now = time.time()
         with self.lock:
             self.latest = (image, captured_ms, now)
@@ -151,14 +210,24 @@ def read_terminal(receiver: Receiver) -> None:
             print("Commands: say <text> | status <text>")
 
 
+def draw_label(image: np.ndarray, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=5050)
+    parser.add_argument("--out", type=Path, help="folder for saved frames (default data/samples/<date-time>)")
+    parser.add_argument("--every", type=int, default=1, help="while recording, keep 1 frame out of N (1)")
     args = parser.parse_args()
 
-    receiver = Receiver()
+    out_dir = args.out or REPO_ROOT / "data" / "samples" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    recorder = Recorder(out_dir, args.every)
+    receiver = Receiver(recorder)
     threading.Thread(target=receiver.serve, args=(args.port,), daemon=True).start()
     threading.Thread(target=read_terminal, args=(receiver,), daemon=True).start()
+    print(f"Frames will be saved in {out_dir}. Keys: s = save frame, r = record, q = quit")
 
     window = "BJ Bridge receiver"
     shown_at = 0.0
@@ -172,12 +241,17 @@ def main() -> None:
                 latency_ms = shown_at * 1000 - captured_ms
                 h, w = image.shape[:2]
                 view = image.copy()
-                label = f"{w}x{h}  {fps:.1f} fps  {frames} frames  latency {latency_ms:.0f} ms"
-                cv2.putText(view, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4)
-                cv2.putText(view, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                draw_label(view, f"{w}x{h}  {fps:.1f} fps  latency {latency_ms:.0f} ms", (10, 30), (0, 255, 0))
+                if recorder.recording:
+                    draw_label(view, f"REC {recorder.saved}", (10, 60), (0, 0, 255))
                 cv2.imshow(window, view)
-            if cv2.waitKey(10) & 0xFF == ord("q"):
+            key = cv2.waitKey(10) & 0xFF
+            if key == ord("q"):
                 break
+            if key == ord("s"):
+                recorder.request_snapshot()
+            elif key == ord("r"):
+                recorder.toggle()
     except KeyboardInterrupt:
         pass
     cv2.destroyAllWindows()
