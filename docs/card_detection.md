@@ -77,7 +77,27 @@ fine-tune a smaller YOLO11n.
   frames without one (about 0.7 s at 15 fps), so a card hidden by a hand keeps its ID;
 - the label is a confidence-weighted vote over the last 15 detections.
 
-## 6. Next steps
+## 6. First test on real footage (2026-11-18)
+
+448 frames recorded through the bridge with the glasses at playing distance, cards dealt on a
+green mat. Over the stream (2.4 GHz Windows hotspot) the SDK dropped to 360×640, which is what we
+use now (on 5 GHz it is stable). Every 4th frame was evaluated (112 frames) on the laptop CPU,
+with `--conf 0.3` and the raw corner boxes:
+
+| Setting                  | Frames with detections | Time per frame |
+|--------------------------|------------------------|----------------|
+| whole frame, `imgsz 640` | 0 / 112                | 59 ms          |
+| whole frame, `imgsz 1280`| 70 / 112               | 225 ms         |
+| `--tiles 1x2`, 640       | 70 / 112               | 211 ms         |
+
+At 360×640 the corner indices are too small at the model's native size and the frame has to be
+upscaled about 2× (`--imgsz 1280`, or tiles). Most frames without detections are from the start
+of the clip, before any card is on the mat. The ace of diamonds and the two of spades are read
+correctly with scores of 0.5-0.8. The king of hearts is often misread as `JH` or `2H`, and
+sometimes only one corner of a card is found. The face cards are where fine-tuning on our deck
+should help most.
+
+## 7. Next steps
 
 1. Record real cards with the glasses at playing distance
    (`mobile/ios/tools/pc_receiver.py --every 5`) and check the pretrained model on them.
