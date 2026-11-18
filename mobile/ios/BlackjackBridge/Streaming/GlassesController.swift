@@ -48,6 +48,8 @@ final class GlassesController {
     @ObservationIgnored private let wearables: WearablesInterface
     @ObservationIgnored private let deviceSelector: AutoDeviceSelector
     @ObservationIgnored private let log: LogStore
+    /// Receives every frame for the PC. Called off the main thread.
+    @ObservationIgnored private let frameSink: PCClient?
     @ObservationIgnored private var deviceSession: DeviceSession?
     @ObservationIgnored private var camera: MWDATCamera.Camera?
     @ObservationIgnored private let sessionTokens = ListenerTokenBag()
@@ -56,9 +58,10 @@ final class GlassesController {
     @ObservationIgnored private var deviceTask: Task<Void, Never>?
     @ObservationIgnored private var frameTimes: [TimeInterval] = []
 
-    init(wearables: WearablesInterface, log: LogStore) {
+    init(wearables: WearablesInterface, log: LogStore, frameSink: PCClient? = nil) {
         self.wearables = wearables
         self.log = log
+        self.frameSink = frameSink
         self.deviceSelector = AutoDeviceSelector(wearables: wearables)
         self.registrationState = wearables.registrationState
         log.add("Registration: \(String(describing: wearables.registrationState))")
@@ -217,11 +220,18 @@ final class GlassesController {
             Task { @MainActor in self?.handleStreamState(state) }
         }.store(in: streamTokens)
 
+        let sink = frameSink
         stream.videoFramePublisher.listen { [weak self] frame in
             // Called off the main thread. Decode here and hop to the main actor with the
             // image only. UIImage is immutable, so handing it over is safe.
             nonisolated(unsafe) let image = frame.makeUIImage()
+            // DAT gives no wall-clock capture time, so the arrival time on the iPhone is
+            // used as the capture time sent to the PC.
             let receivedAt = Date().timeIntervalSince1970
+            if let image {
+                // Straight to the PC client's queue, without waiting for the main actor.
+                sink?.submitFrame(image, capturedAtMs: Int64((receivedAt * 1000).rounded()))
+            }
             Task { @MainActor in self?.handleFrame(image, receivedAt: receivedAt) }
         }.store(in: streamTokens)
 

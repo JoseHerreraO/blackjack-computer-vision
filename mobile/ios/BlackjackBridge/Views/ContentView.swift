@@ -59,16 +59,19 @@ struct ContentView: View {
     }
 
     private var pcSection: some View {
-        Section("PC") {
+        let isDisconnected = model.connectionState == .disconnected
+        return Section("PC") {
             TextField("192.168.1.50:5050", text: $model.serverAddressText)
                 .keyboardType(.numbersAndPunctuation)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .font(.body.monospaced())
-            Button(model.connectionState == .disconnected ? "Connect" : "Disconnect") {
+                // Editing the address only applies on the next connect.
+                .disabled(!isDisconnected)
+            Button(isDisconnected ? "Connect" : "Disconnect") {
                 model.toggleConnection()
             }
-            .disabled(model.serverAddress == nil)
+            .disabled(isDisconnected && model.serverAddress == nil)
         }
     }
 

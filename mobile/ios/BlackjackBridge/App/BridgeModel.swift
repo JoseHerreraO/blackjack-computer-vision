@@ -14,13 +14,6 @@ import Observation
 @MainActor
 @Observable
 final class BridgeModel {
-    /// Connection state shown on screen.
-    enum ConnectionState: String {
-        case disconnected
-        case connecting
-        case connected
-    }
-
     private enum DefaultsKey {
         static let serverAddress = "serverAddress"
         static let resolution = "streamResolution"
@@ -29,6 +22,7 @@ final class BridgeModel {
 
     let log: LogStore
     let glasses: GlassesController
+    let pc: PCClient
 
     /// PC receiver as "host:port", persisted in UserDefaults.
     var serverAddressText: String {
@@ -43,8 +37,9 @@ final class BridgeModel {
         didSet { UserDefaults.standard.set(Int(frameRate), forKey: DefaultsKey.frameRate) }
     }
 
-    var connectionState: ConnectionState = .disconnected
+    var connectionState: PCConnectionState = .disconnected
     var framesSent = 0
+    /// Frames written to the PC per second, averaged over the last two seconds.
     var sendFps = 0.0
     var lastCommand: String?
 
@@ -60,13 +55,18 @@ final class BridgeModel {
 
     var appVersion: String { Self.appVersion }
 
+    @ObservationIgnored private var pcTask: Task<Void, Never>?
+    @ObservationIgnored private var sentTimes: [TimeInterval] = []
+
     init() {
         let defaults = UserDefaults.standard
         serverAddressText = defaults.string(forKey: DefaultsKey.serverAddress) ?? ""
-        resolution = defaults.string(forKey: DefaultsKey.resolution)
+        let resolution = defaults.string(forKey: DefaultsKey.resolution)
             .flatMap(StreamResolution.init(rawValue:)) ?? StreamSettings.defaultResolution
         let storedRate = UInt(defaults.integer(forKey: DefaultsKey.frameRate))
-        frameRate = StreamSettings.frameRates.contains(storedRate) ? storedRate : StreamSettings.defaultFrameRate
+        let frameRate = StreamSettings.frameRates.contains(storedRate) ? storedRate : StreamSettings.defaultFrameRate
+        self.resolution = resolution
+        self.frameRate = frameRate
 
         let log = LogStore()
         self.log = log
@@ -78,22 +78,83 @@ final class BridgeModel {
         } catch {
             log.add("Wearables SDK configuration failed: \(error.localizedDescription)")
         }
-        glasses = GlassesController(wearables: Wearables.shared, log: log)
+
+        let pc = PCClient(appVersion: Self.appVersion, stream: Self.streamInfo(resolution, frameRate))
+        self.pc = pc
+        glasses = GlassesController(wearables: Wearables.shared, log: log, frameSink: pc)
+        // Every log line also goes to the PC (dropped while disconnected).
+        log.onEntry = { [weak pc] entry in pc?.sendLog(entry.line) }
+
+        pcTask = Task { [weak self] in
+            for await event in pc.events {
+                guard let self else { return }
+                self.handle(event)
+            }
+        }
     }
 
     /// Starts the glasses stream with the resolution and frame rate chosen on screen.
     func startGlassesStream() {
         log.add("Requesting \(resolution.label) @ \(frameRate) fps")
+        pc.updateStream(Self.streamInfo(resolution, frameRate))
         let configuration = StreamSettings.configuration(resolution: resolution, frameRate: frameRate)
         Task { await glasses.startStreaming(configuration: configuration) }
     }
 
-    /// Placeholder until the TCP client exists (step 3).
+    /// Connects to the PC (and keeps retrying every 2 s) or disconnects.
     func toggleConnection() {
+        if connectionState != .disconnected {
+            pc.disconnect()
+            return
+        }
         guard let address = serverAddress else {
             log.add("Invalid PC address \"\(serverAddressText)\". Use host:port, e.g. 192.168.1.50:5050")
             return
         }
-        log.add("Connect to \(address) requested. The TCP client is not implemented yet")
+        pc.connect(to: address)
+    }
+
+    // MARK: - PC events
+
+    private func handle(_ event: PCClient.Event) {
+        switch event {
+        case .state(let state):
+            connectionState = state
+            if state != .connected {
+                sentTimes.removeAll()
+                sendFps = 0
+            }
+        case .log(let message):
+            log.add(message)
+        case .frameSent:
+            countSentFrame()
+        case .command(let payload):
+            handleCommand(payload)
+        }
+    }
+
+    private func countSentFrame() {
+        framesSent += 1
+        let now = Date().timeIntervalSince1970
+        sentTimes.append(now)
+        sentTimes.removeAll { now - $0 > 2 }
+        if let first = sentTimes.first, sentTimes.count > 1, now > first {
+            sendFps = Double(sentTimes.count - 1) / (now - first)
+        }
+    }
+
+    /// Shows and logs commands from the PC. Speaking them is step 4.
+    private func handleCommand(_ payload: Data) {
+        guard let command = try? JSONDecoder().decode(BridgeProtocol.Command.self, from: payload) else {
+            log.add("Unreadable command: \(String(decoding: payload, as: UTF8.self))")
+            return
+        }
+        let text = command.text ?? ""
+        lastCommand = "\(command.type): \(text)"
+        log.add("Command \(command.type): \(text)")
+    }
+
+    private static func streamInfo(_ resolution: StreamResolution, _ frameRate: UInt) -> StreamInfo {
+        StreamInfo(width: resolution.width, height: resolution.height, fps: Int(frameRate))
     }
 }
