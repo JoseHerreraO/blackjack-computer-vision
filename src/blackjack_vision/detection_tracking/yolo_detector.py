@@ -11,7 +11,7 @@ into overlapping tiles (one column and two rows by default). Each tile is close 
 native size, which keeps the small corner indices readable.
 
 ``ultralytics`` is an optional dependency (``pip install -e ".[yolo]"``) and is only imported when
-a :class:`CardDetector` is created, so the rest of the package works without it.
+a :class:`YoloCardDetector` is created, so the rest of the package works without it.
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ def tile_grid(
     return [(x, y, w, h) for y, h in spans(height, rows) for x, w in spans(width, columns)]
 
 
-class CardDetector:
+class YoloCardDetector:
     """YOLO card detector with tiling and corner merging.
 
     Args:
@@ -172,7 +172,9 @@ class CardDetector:
         try:
             from ultralytics import YOLO
         except ImportError as error:  # pragma: no cover - depends on the environment
-            raise ImportError('CardDetector needs ultralytics: pip install -e ".[yolo]"') from error
+            raise ImportError(
+                'YoloCardDetector needs ultralytics: pip install -e ".[yolo]"'
+            ) from error
 
         self.model = YOLO(str(weights))
         self.names: dict[int, str] = dict(self.model.names)

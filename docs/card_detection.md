@@ -4,7 +4,7 @@ Cards are detected with a YOLO model and followed across frames with our own Kal
 ByteTrack (built into Ultralytics) is the fallback if the tracker falls short.
 
 ```
-glasses -> iPhone (BJ Bridge app) --TCP 5050--> BridgeSource -> [Undistorter] -> CardDetector -> CardTracker
+glasses -> iPhone (BJ Bridge app) --TCP 5050--> BridgeSource -> [Undistorter] -> YoloCardDetector -> CardTracker
 ```
 
 ## 1. Setup

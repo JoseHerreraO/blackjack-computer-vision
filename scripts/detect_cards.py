@@ -34,8 +34,12 @@ import numpy as np
 from blackjack_vision.calibration.camera_model import CameraModel
 from blackjack_vision.calibration.undistort import Undistorter
 from blackjack_vision.capture.sources import open_source, write_image
-from blackjack_vision.detection_tracking.detector import DEFAULT_WEIGHTS, CardDetector, Detection
 from blackjack_vision.detection_tracking.tracker import CardTracker, TrackerUpdate
+from blackjack_vision.detection_tracking.yolo_detector import (
+    DEFAULT_WEIGHTS,
+    Detection,
+    YoloCardDetector,
+)
 
 WINDOW = "cards"
 PREVIEW_MAX_HEIGHT = 900
@@ -106,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s"
     )
 
-    detector = CardDetector(
+    detector = YoloCardDetector(
         args.weights,
         confidence=args.conf,
         image_size=args.imgsz,

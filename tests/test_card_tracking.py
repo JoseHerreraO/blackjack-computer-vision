@@ -1,14 +1,14 @@
 import numpy as np
 import pytest
 
-from blackjack_vision.detection_tracking.detector import (
+from blackjack_vision.detection_tracking.tracker import BoxKalmanFilter, CardTracker
+from blackjack_vision.detection_tracking.yolo_detector import (
     Detection,
     box_iou,
     merge_corners,
     non_max_suppression,
     tile_grid,
 )
-from blackjack_vision.detection_tracking.tracker import BoxKalmanFilter, CardTracker
 
 
 def det(x, y, w=20, h=40, label="AH", confidence=0.9):

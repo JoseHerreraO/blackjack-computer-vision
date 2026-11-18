@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from blackjack_vision.detection_tracking.detector import Detection, box_iou
+from blackjack_vision.detection_tracking.yolo_detector import Detection, box_iou
 
 
 def _to_measurement(box: np.ndarray) -> np.ndarray:
