@@ -14,7 +14,20 @@ Pipeline:
    error alone does not prove a good calibration: poor pose variety or too many distortion
    coefficients can overfit.
 
-Reference: Z. Zhang, "A flexible new technique for camera calibration", IEEE TPAMI 22(11), 2000.
+Two options help with real, imperfect boards:
+
+* ``detector="sb"`` uses ``findChessboardCornersSB`` with ``CALIB_CB_ACCURACY`` (Duda and
+  Frese's sector-based detector), more accurate than ``findChessboardCorners`` + ``cornerSubPix``
+  on noisy or compressed photos.
+* ``release_object=True`` uses ``calibrateCameraRO`` (Strobl and Hirzinger's "releasing the
+  object" method): the 3D board points are estimated together with the camera, so a printed
+  sheet that is not perfectly flat or not printed exactly to scale no longer inflates the error.
+  :func:`plane_fit_errors` measures how far each view is from an ideal flat board, which helps to
+  spot blurred views and curled paper before calibrating.
+
+References: Z. Zhang, "A flexible new technique for camera calibration", IEEE TPAMI 22(11), 2000.
+K. H. Strobl and G. Hirzinger, "More accurate pinhole camera calibration with imperfect planar
+target", ICCV Workshops, 2011.
 """
 
 from __future__ import annotations
@@ -38,6 +51,7 @@ GOOD_RMS = 0.3
 ACCEPTABLE_RMS = 0.5
 _SUBPIX_HALF_WINDOW_LIMITS = (2, 11)
 _INTRINSIC_NAMES = ("fx", "fy", "cx", "cy")
+DETECTORS = ("classic", "sb")
 
 FrameCallback = Callable[[Frame, np.ndarray | None, bool], bool | None]
 
@@ -121,21 +135,34 @@ def find_corners(
     *,
     refine: bool = True,
     fast_check: bool = True,
+    detector: str = "classic",
 ) -> np.ndarray | None:
     """Locate the inner chessboard corners with sub-pixel accuracy.
 
     Args:
         image: BGR or grayscale image.
         spec: Pattern geometry.
-        refine: Refine the corners with ``cornerSubPix`` (needed for sub-0.5 px errors).
+        refine: Refine the corners with ``cornerSubPix`` (classic detector only; the SB detector
+            is already sub-pixel accurate).
         fast_check: Quickly reject images without a board (``CALIB_CB_FAST_CHECK``), which
-            matters for videos where most frames do not show the complete pattern.
+            matters for videos where most frames do not show the complete pattern (classic
+            detector only).
+        detector: ``"classic"`` (``findChessboardCorners`` + ``cornerSubPix``) or ``"sb"``
+            (``findChessboardCornersSB`` with ``CALIB_CB_ACCURACY``).
 
     Returns:
         Corners as an ``(N, 2)`` ``float32`` array in OpenCV order, or ``None`` if the complete
         pattern was not found.
     """
+    if detector not in DETECTORS:
+        raise ValueError(f"Unknown detector {detector!r}, expected one of {DETECTORS}")
     gray = to_gray(image)
+    if detector == "sb":
+        flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY | cv2.CALIB_CB_NORMALIZE_IMAGE
+        found, corners = cv2.findChessboardCornersSB(gray, spec.inner_corners, flags=flags)
+        if not found or corners is None:
+            return None
+        return corners.reshape(-1, 2).astype(np.float32)
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
     if fast_check:
         flags |= cv2.CALIB_CB_FAST_CHECK
@@ -154,6 +181,42 @@ def draw_corners(image: np.ndarray, corners: np.ndarray, spec: ChessboardSpec) -
     points = np.asarray(corners, np.float32).reshape(-1, 1, 2)
     cv2.drawChessboardCorners(canvas, spec.inner_corners, points, True)
     return canvas
+
+
+def orient_corners(corners: np.ndarray, spec: ChessboardSpec) -> np.ndarray:
+    """Corners numbered so that the first row is the upper one in the image.
+
+    A board with an odd number of squares on both sides looks the same after a 180-degree turn,
+    so the detector may number its corners from either end. That is harmless for the standard
+    calibration, but ``calibrate(release_object=True)`` estimates one board shape shared by all
+    views and needs every index to be the same physical corner. Taking the upper row first is
+    consistent as long as all photos are taken from the same side of the board.
+    """
+    points = np.asarray(corners, np.float32).reshape(-1, 2)
+    columns, rows = spec.inner_corners
+    grid = points.reshape(rows, columns, 2)
+    if grid[0, :, 1].mean() > grid[-1, :, 1].mean():
+        return points[::-1].copy()
+    return points
+
+
+def plane_fit_errors(image_points: Sequence[np.ndarray], spec: ChessboardSpec) -> np.ndarray:
+    """RMS distance (px) between each view's corners and the best homography of a flat board.
+
+    A homography is the most general mapping of a plane into an image, so this error does not
+    depend on any camera model: with a flat, accurately printed board, sharp images and a lens
+    with little distortion over the board it should be about 0.1-0.2 px. Larger values point to
+    blur, heavy compression or a sheet that is not flat. Views far above the rest are good
+    candidates to drop (``calibrate(max_plane_error=...)``).
+    """
+    board = spec.object_points()[:, :2].astype(np.float64)
+    errors = []
+    for points in image_points:
+        points = np.asarray(points, np.float64).reshape(-1, 2)
+        homography, _ = cv2.findHomography(board, points, 0)
+        projected = cv2.perspectiveTransform(board.reshape(-1, 1, 2), homography).reshape(-1, 2)
+        errors.append(float(np.sqrt(((projected - points) ** 2).sum(axis=1).mean())))
+    return np.array(errors)
 
 
 @dataclass
@@ -189,6 +252,7 @@ def collect_views(
     max_views: int | None = None,
     keep_images: bool = False,
     on_frame: FrameCallback | None = None,
+    detector: str = "classic",
 ) -> ViewCollection:
     """Detect the board in a stream of frames and keep a diverse set of views.
 
@@ -205,6 +269,7 @@ def collect_views(
         keep_images: Also store the kept frames (to save annotated images for the report).
         on_frame: Called as ``on_frame(frame, corners_or_None, accepted)`` after every processed
             frame. Returning ``False`` stops the collection (e.g. the user pressed ``q``).
+        detector: Corner detector, see :func:`find_corners`.
 
     Raises:
         ValueError: if frames of different sizes are mixed (a calibration is per resolution).
@@ -223,7 +288,7 @@ def collect_views(
                 "calibrate each resolution separately"
             )
         views.frames_processed += 1
-        corners = find_corners(frame.image, spec)
+        corners = find_corners(frame.image, spec, detector=detector)
         accepted = False
         if corners is not None:
             views.frames_with_board += 1
@@ -265,6 +330,8 @@ class CalibrationResult:
         std_intrinsics: Standard deviation of every intrinsic parameter estimated by OpenCV
             (``fx, fy, cx, cy, k1, k2, p1, p2, k3, ...``).
         rejected_views: Views discarded as outliers before the final estimation.
+        board_points: Board corners used in the final estimation, ``(N, 3)``. The ideal grid,
+            or the shape estimated by the release-object method.
     """
 
     camera: CameraModel
@@ -274,6 +341,7 @@ class CalibrationResult:
     tvecs: list[np.ndarray]
     std_intrinsics: np.ndarray
     rejected_views: list[str] = field(default_factory=list)
+    board_points: np.ndarray | None = None
 
     @property
     def rms(self) -> float:
@@ -314,9 +382,21 @@ class CalibrationResult:
             f"  distortion: {np.array2string(camera.dist_coeffs.ravel(), precision=4)}",
             f"  field of view: {horizontal:.1f} deg x {vertical:.1f} deg",
         ]
+        if self.board_points is not None and camera.metadata.get("release_object"):
+            ideal = camera.metadata.get("square_size", 1.0)
+            deviation = np.linalg.norm(self.board_points - self._ideal_board(), axis=1)
+            lines.append(
+                f"  release object: board deviates up to {deviation.max():.3f} "
+                f"(square = {ideal:g}) from the ideal flat grid"
+            )
         if self.rejected_views:
-            lines.append(f"  rejected outlier views: {', '.join(self.rejected_views)}")
+            lines.append(f"  rejected views: {', '.join(self.rejected_views)}")
         return "\n".join(lines)
+
+    def _ideal_board(self) -> np.ndarray:
+        columns, rows = (int(v) for v in self.camera.metadata["pattern"].split("x"))
+        spec = ChessboardSpec((columns, rows), float(self.camera.metadata["square_size"]))
+        return spec.object_points().astype(np.float64)
 
 
 def calibrate(
@@ -331,6 +411,9 @@ def calibrate(
     zero_tangent: bool = False,
     reject_outliers: bool = True,
     min_views: int = 5,
+    fix_aspect_ratio: bool = False,
+    release_object: bool = False,
+    max_plane_error: float | None = None,
 ) -> CalibrationResult:
     """Estimate the camera intrinsics and distortion from several views of the chessboard.
 
@@ -345,6 +428,12 @@ def calibrate(
         zero_tangent: Assume no tangential distortion (``p1 = p2 = 0``).
         reject_outliers: Discard views whose error is far above the rest and recalibrate once.
         min_views: Never keep fewer views than this when rejecting outliers.
+        fix_aspect_ratio: Force ``fx = fy`` (square pixels, true for practically every camera).
+        release_object: Estimate the board points too (``calibrateCameraRO``), for printed boards
+            that are not perfectly flat. Views are re-numbered with :func:`orient_corners`, so
+            all photos must be taken from the same side of the board.
+        max_plane_error: Drop, before calibrating, the views whose :func:`plane_fit_errors` is
+            above this value in pixels (blurred views, curled paper).
 
     Raises:
         ValueError: with fewer than :data:`MIN_VIEWS` views or mismatched corner counts.
@@ -361,7 +450,26 @@ def calibrate(
         if np.asarray(points).reshape(-1, 2).shape[0] != spec.n_corners:
             raise ValueError(f"View {view!r} does not have {spec.n_corners} corners")
 
+    if max_plane_error is not None:
+        plane = plane_fit_errors(image_points, spec)
+        keep = plane <= max_plane_error
+        if int(keep.sum()) < max(MIN_VIEWS, min(min_views, n_views)):
+            raise ValueError(
+                f"Only {int(keep.sum())} views have a plane-fit error <= {max_plane_error} px"
+            )
+        dropped = [view for view, kept in zip(names, keep, strict=True) if not kept]
+        if dropped:
+            logger.info("Dropping %d view(s) with a high plane-fit error", len(dropped))
+        image_points = [p for p, kept in zip(image_points, keep, strict=True) if kept]
+        names = [view for view, kept in zip(names, keep, strict=True) if kept]
+    else:
+        dropped = []
+    if release_object:
+        image_points = [orient_corners(points, spec) for points in image_points]
+
     flags = 0
+    if fix_aspect_ratio:
+        flags |= cv2.CALIB_FIX_ASPECT_RATIO
     if rational_model:
         flags |= cv2.CALIB_RATIONAL_MODEL
     if fix_k3:
@@ -369,7 +477,8 @@ def calibrate(
     if zero_tangent:
         flags |= cv2.CALIB_ZERO_TANGENT_DIST
 
-    result = _calibrate_once(image_points, names, spec, image_size, flags, name)
+    n_views = len(image_points)
+    result = _calibrate_once(image_points, names, spec, image_size, flags, name, release_object)
     if reject_outliers and n_views > min_views:
         keep = result.per_view_errors <= _outlier_threshold(result.per_view_errors)
         if not keep.all() and int(keep.sum()) >= min_views:
@@ -382,9 +491,14 @@ def calibrate(
                 image_size,
                 flags,
                 name,
+                release_object,
             )
             result.rejected_views = rejected
-            result.camera.metadata["rejected_views"] = rejected
+    if dropped:
+        result.rejected_views = dropped + result.rejected_views
+        result.camera.metadata["max_plane_error"] = max_plane_error
+    if result.rejected_views:
+        result.camera.metadata["rejected_views"] = result.rejected_views
     return result
 
 
@@ -406,21 +520,42 @@ def _calibrate_once(
     image_size: tuple[int, int],
     flags: int,
     name: str,
+    release_object: bool = False,
 ) -> CalibrationResult:
     object_points = [spec.object_points() for _ in image_points]
     points = [np.asarray(view, np.float32).reshape(-1, 1, 2) for view in image_points]
-    (
-        rms,
-        camera_matrix,
-        dist_coeffs,
-        rvecs,
-        tvecs,
-        std_intrinsics,
-        _std_extrinsics,
-        per_view_errors,
-    ) = cv2.calibrateCameraExtended(
-        object_points, points, tuple(int(v) for v in image_size), None, None, flags=flags
-    )
+    size = tuple(int(v) for v in image_size)
+    board = spec.object_points()
+    if release_object:
+        # The far end of the first row stays fixed (with the origin) to keep the scale, as the
+        # OpenCV documentation recommends.
+        fixed_point = spec.inner_corners[0] - 1
+        (
+            rms,
+            camera_matrix,
+            dist_coeffs,
+            rvecs,
+            tvecs,
+            new_board,
+            std_intrinsics,
+            _std_extrinsics,
+            _std_board,
+            per_view_errors,
+        ) = cv2.calibrateCameraROExtended(
+            object_points, points, size, fixed_point, None, None, flags=flags
+        )
+        board = np.asarray(new_board, np.float64).reshape(-1, 3)
+    else:
+        (
+            rms,
+            camera_matrix,
+            dist_coeffs,
+            rvecs,
+            tvecs,
+            std_intrinsics,
+            _std_extrinsics,
+            per_view_errors,
+        ) = cv2.calibrateCameraExtended(object_points, points, size, None, None, flags=flags)
     camera = CameraModel(
         camera_matrix=camera_matrix,
         dist_coeffs=dist_coeffs,
@@ -428,11 +563,16 @@ def _calibrate_once(
         rms=float(rms),
         name=name,
         metadata={
-            "method": "Zhang chessboard calibration (cv2.calibrateCamera)",
+            "method": (
+                "Zhang chessboard calibration with release object (cv2.calibrateCameraRO)"
+                if release_object
+                else "Zhang chessboard calibration (cv2.calibrateCamera)"
+            ),
             "pattern": str(spec),
             "square_size": spec.square_size,
             "n_views": len(names),
             "flags": int(flags),
+            "release_object": bool(release_object),
             "opencv_version": cv2.__version__,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         },
@@ -444,4 +584,5 @@ def _calibrate_once(
         rvecs=[np.asarray(r).ravel() for r in rvecs],
         tvecs=[np.asarray(t).ravel() for t in tvecs],
         std_intrinsics=np.asarray(std_intrinsics, np.float64).ravel(),
+        board_points=np.asarray(board, np.float64),
     )

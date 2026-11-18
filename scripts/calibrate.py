@@ -15,6 +15,9 @@ Examples::
 
     # Live webcam: move the board around until enough views are collected (q or Esc to stop):
     python scripts/calibrate.py --source 0 --pattern 9x6 --square-size 25 --name webcam
+
+    # Printed sheet that is not perfectly flat, noisy photos (what worked for the glasses photos):
+    python scripts/calibrate.py --source data/calibration/gafas_foto/ --pattern 6x4         --square-size 25 --name gafas_foto --detector sb --release-object --fix-k3         --zero-tangent --max-plane-error 0.6
 """
 
 from __future__ import annotations
@@ -78,6 +81,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rational", action="store_true", help="8-coefficient rational model")
     parser.add_argument("--fix-k3", action="store_true", help="keep k3 = 0 (narrow lenses)")
     parser.add_argument(
+        "--zero-tangent", action="store_true", help="assume no tangential distortion (p1 = p2 = 0)"
+    )
+    parser.add_argument("--fix-aspect", action="store_true", help="force fx = fy (square pixels)")
+    parser.add_argument(
+        "--detector",
+        choices=["classic", "sb"],
+        default="classic",
+        help="corner detector: classic (findChessboardCorners + cornerSubPix) or sb "
+        "(findChessboardCornersSB, more accurate on noisy photos)",
+    )
+    parser.add_argument(
+        "--release-object",
+        action="store_true",
+        help="estimate the board shape too (calibrateCameraRO) for sheets that are not flat; "
+        "all photos must be taken from the same side of the board",
+    )
+    parser.add_argument(
+        "--max-plane-error",
+        type=float,
+        help="drop views whose flat-board homography error exceeds this many pixels",
+    )
+    parser.add_argument(
         "--keep-outliers", action="store_true", help="do not discard views with abnormal error"
     )
     parser.add_argument("--preview", action="store_true", help="show detections while collecting")
@@ -109,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             max_views=args.max_views,
             keep_images=args.debug_dir is not None,
             on_frame=_preview_callback(spec, args.max_views) if preview else None,
+            detector=args.detector,
         )
     if preview:
         cv2.destroyAllWindows()
@@ -133,6 +159,10 @@ def main(argv: list[str] | None = None) -> int:
         name=args.name,
         rational_model=args.rational,
         fix_k3=args.fix_k3,
+        zero_tangent=args.zero_tangent,
+        fix_aspect_ratio=args.fix_aspect,
+        release_object=args.release_object,
+        max_plane_error=args.max_plane_error,
         reject_outliers=not args.keep_outliers,
     )
     print(result.report())

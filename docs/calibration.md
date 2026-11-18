@@ -46,6 +46,15 @@ shifts the corners):
 
 ## 4. Running the calibration
 
+**Step by step (notebook).** `notebooks/01_calibracion_camara.ipynb` follows the same steps as Lab 2
+(load, `findChessboardCorners`, `cornerSubPix`, `drawChessboardCorners`, 3D board points,
+`calibrateCamera`, the lab questions and undistortion) on our own photos, adds the quality checks
+of section 5 and saves the figures for the report in `outputs/calibration/<name>/`. Put the photos
+in `data/calibration/fotos/`, set the parameters in its first cells and run it
+(`pip install -e ".[notebooks]"` installs Jupyter's kernel and matplotlib).
+
+**Command line.**
+
 ```bash
 # From a video (1 frame out of 5 is analysed; near-duplicate views are skipped)
 python scripts/calibrate.py --source data/calibration/glasses_high.mp4 --pattern 9x6 \
@@ -57,6 +66,17 @@ python scripts/calibrate.py --source data/calibration/webcam/ --pattern 9x6 --sq
 
 # Live from the webcam (press q or Esc when enough views are collected)
 python scripts/calibrate.py --source 0 --pattern 9x6 --square-size 25 --name webcam
+```
+
+**Imperfect printed boards.** A sheet that is not perfectly flat (or not printed exactly to
+scale) puts a floor under the RMS error that no camera model can remove. `--detector sb` uses the
+more accurate `findChessboardCornersSB`, `--release-object` estimates the board shape together
+with the camera (`calibrateCameraRO`; take every photo from the same side of the board) and
+`--max-plane-error 0.6` drops views far from a flat board (blur, lifted paper). With the glasses
+photos these brought the RMS from 0.55 px to 0.33 px (leave-one-out 0.39 px):
+
+```bash
+python scripts/calibrate.py --source data/calibration/gafas_foto/ --pattern 6x4 --square-size 25 \n    --name gafas_foto --detector sb --release-object --fix-k3 --zero-tangent
 ```
 
 Views whose reprojection error is far above the others (blur, wrong detections) are discarded
