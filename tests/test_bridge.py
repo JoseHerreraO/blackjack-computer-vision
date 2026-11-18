@@ -130,3 +130,21 @@ def test_release_unblocks_read(bridge):
     bridge._timeout = None
     bridge.release()
     assert bridge.read() is None
+
+
+def test_new_connection_replaces_a_dead_one(bridge, iphone):
+    # The first iPhone goes silent without closing, like a phone that lost the Wi-Fi.
+    iphone.sendall(_frame_message(1_000, 10))
+    assert bridge.read() is not None
+
+    again = socket.create_connection(("127.0.0.1", bridge.port), timeout=2.0)
+    try:
+        again.sendall(_frame_message(2_000, 90))
+        frame = bridge.read()
+        assert frame is not None and frame.name == "2000"
+        _wait_until(lambda: bridge.connected)
+        assert bridge.say("sigo aqui")
+        kind, _ = _read_message(again)
+        assert kind == COMMAND
+    finally:
+        again.close()

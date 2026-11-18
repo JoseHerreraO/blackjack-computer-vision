@@ -98,7 +98,7 @@ class BridgeSource(FrameSource):
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind((host, port))
-        self._server.listen(1)
+        self._server.listen(4)
         self.port = self._server.getsockname()[1]
         self._thread = threading.Thread(target=self._serve, name="bridge-server", daemon=True)
         self._thread.start()
@@ -160,10 +160,7 @@ class BridgeSource(FrameSource):
             self._condition.notify_all()
         for sock in (client, self._server):
             if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+                _close_quietly(sock)
 
     # Commands to the iPhone --------------------------------------------------------------------
 
@@ -197,21 +194,31 @@ class BridgeSource(FrameSource):
             except OSError:
                 return  # released
             client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            logger.info("iPhone connected from %s:%d", *address)
+            _enable_keepalive(client)
+            # An iPhone that vanished without closing (Wi-Fi lost, app suspended) leaves a dead
+            # connection that never errors. A new connection means the app reconnected, so it
+            # replaces the old one instead of queueing behind it.
             with self._condition:
-                self._client = client
-            try:
-                self._read_messages(client)
-            except (ConnectionError, OSError) as error:
-                if not self._closed:
-                    logger.info("iPhone disconnected: %s", error)
-            finally:
-                with self._condition:
+                previous, self._client = self._client, client
+            if previous is not None:
+                logger.info("A new connection replaces the previous one")
+                _close_quietly(previous)
+            threading.Thread(
+                target=self._handle_client, args=(client, address), daemon=True
+            ).start()
+
+    def _handle_client(self, client: socket.socket, address: tuple[str, int]) -> None:
+        logger.info("iPhone connected from %s:%d", *address)
+        try:
+            self._read_messages(client)
+        except (ConnectionError, OSError) as error:
+            if not self._closed:
+                logger.info("iPhone disconnected: %s", error)
+        finally:
+            with self._condition:
+                if self._client is client:
                     self._client = None
-                try:
-                    client.close()
-                except OSError:
-                    pass
+            _close_quietly(client)
 
     def _read_messages(self, client: socket.socket) -> None:
         while not self._closed:
@@ -247,6 +254,29 @@ class BridgeSource(FrameSource):
             self._latest_seq += 1
             self.frames_received += 1
             self._condition.notify_all()
+
+
+def _enable_keepalive(sock: socket.socket) -> None:
+    """Detect a vanished iPhone in about 15 s instead of waiting forever."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):  # Windows: on, 5 s idle, 1 s between probes
+        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5000, 1000))
+    elif hasattr(socket, "TCP_KEEPIDLE"):  # Linux
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 5)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 10)
+
+
+def _close_quietly(sock: socket.socket) -> None:
+    """Close a socket and wake up any thread blocked reading it."""
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 def _read_exact(client: socket.socket, length: int) -> bytes:
