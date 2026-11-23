@@ -44,11 +44,22 @@ def test_colour_of_number_cards_and_aces(crops):
 
 def test_black_face_cards_do_not_read_red(crops):
     for name, card, image in crops:
-        if card.rank not in FACES:
+        if card.rank not in FACES or card.suit.is_red:
             continue
         assert picture_box(image) is not None, name
         assert red_ink_fraction(image) < RED_INK_THRESHOLD, name  # artwork left out
         assert card_colour(image) is None, name  # colour left to the suit shape
+
+
+def test_red_face_cards_read_red_but_colour_stays_unknown(crops):
+    """The red index ink of a red face card is measured, but the colour is still left to the
+    suit shape, like for every face card."""
+    red_faces = [(n, c, i) for n, c, i in crops if c.rank in FACES and c.suit.is_red]
+    assert red_faces, "no red face card among the crops"
+    for name, _, image in red_faces:
+        assert picture_box(image) is not None, name
+        assert red_ink_fraction(image) >= RED_INK_THRESHOLD, name
+        assert card_colour(image) is None, name
 
 
 def test_pips_are_counted_and_only_aces_pass(crops):
