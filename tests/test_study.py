@@ -1,4 +1,5 @@
 import csv
+import importlib.util
 import runpy
 from pathlib import Path
 
@@ -104,4 +105,5 @@ def test_script_writes_csv_table_and_plot(tmp_path, data):
         rows = list(csv.DictReader(file))
     assert {row["study"] for row in rows} == {"baseline", "vocabulary", "pyramid", "kernel"}
     assert "separate recording" in (tmp_path / "out" / "results.md").read_text(encoding="utf-8")
-    assert (tmp_path / "out" / "vocabulary.png").is_file()
+    if importlib.util.find_spec("matplotlib") is not None:  # optional: not in requirements.txt
+        assert (tmp_path / "out" / "vocabulary.png").is_file()
