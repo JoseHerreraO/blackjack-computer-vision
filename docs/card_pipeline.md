@@ -15,13 +15,18 @@ frame -> CardDetector (classical, corners) -> CardTracker (IDs) -> crop buffer p
   #19). It gives the four corners of every card, which the homography needs to straighten it,
   and it does not fire on the laptop or the phone. The whole-card YOLO of the recognizer's repo
   finds the cards too but only gives axis-aligned boxes and also boxes the laptop (0.91).
-- **Naming the card** is done by a learned recognizer, the embedding network of
+- **Naming the card** is done by the classical recogniser by default (bag of words + χ² SVM for
+  the rank, NCC templates for the suit, Temas 3-4; `--recognizer classic`, trained with
+  `scripts/train_recognizer.py`), which reports a card as unknown when its rank's weakest
+  one-vs-one SVM margin is below 0.4. For comparison it can be a learned recognizer
+  (`--recognizer embedding`), the embedding network of
   [`irfanhossainsust/playing-card-detector`](https://huggingface.co/irfanhossainsust/playing-card-detector)
   (AGPL-3.0), trained on photos of many deck designs with blur, glare, perspective and
   low-resolution augmentations. It compares the straightened card with 7,624 reference
   embeddings and needs no training on our deck. Below a cosine similarity of 0.70 the card is
-  reported as unknown instead of guessed. The classical bag-of-words recognizer (#15) stays for
-  comparison.
+  reported as unknown instead of guessed. Both are to be measured on the same held-out
+  recording of the 52 cards; the classical one stays the main recogniser if it gets close, as
+  the course syllabus asks.
 
 ## Real time
 

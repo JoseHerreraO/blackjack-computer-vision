@@ -35,6 +35,25 @@ python scripts/capture_cards.py --source 0 --deck
 
 ## 2. Training and evaluation
 
+Capture the cards with the same camera and view they will be used with. With the glasses
+(`--source bridge`) `capture_cards.py` uses `--view glasses` automatically: a single card gives no
+foreshortening estimate, and with the default view an upright card would be saved rotated by
+90 degrees.
+
+Record **two separate sessions** (different time, light and positions): one to train and one to
+test, and evaluate with `--test-data`. A random split of the same recording is optimistic,
+because its training and test crops are almost the same pictures.
+
+```bash
+python scripts/train_recognizer.py --data data/cards --test-data data/cards_test     --out data/models/recognizer.joblib --errors-dir outputs/recognition_errors
+```
+
+The report includes how many cards `recognise()` would name at its confidence threshold (the
+weakest one-vs-one SVM margin of the winning rank, 0.4 by default) and how many of those are
+right. This is what the real-time pipeline uses (`scripts/track_cards.py --recognizer classic`):
+below the threshold a card stays `?` and is tried again with fresher crops.
+
+
 ```bash
 python scripts/train_recognizer.py --data data/cards --out data/models/recognizer.joblib \
     --errors-dir outputs/recognition_errors

@@ -30,9 +30,12 @@ from blackjack_vision.calibration.camera_model import CameraModel
 from blackjack_vision.calibration.undistort import Undistorter
 from blackjack_vision.capture.sources import ImageSequenceSource, open_source, write_image
 from blackjack_vision.detection_tracking.card_detector import (
+    VIEWS,
     CardDetector,
     CardDetectorConfig,
     Segmentation,
+    config_for_view,
+    default_view,
     draw_detections,
 )
 from blackjack_vision.vision_classic.rectify import CARD_SIZE, rectify_card
@@ -49,6 +52,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--source", required=True, help="video, image folder, camera index or URL")
+    parser.add_argument(
+        "--view",
+        choices=VIEWS,
+        help="glasses (table seen at an angle) or top (camera above the table); "
+        "glasses by default for --source bridge, top otherwise",
+    )
     parser.add_argument("--camera", type=Path, help="camera model JSON to undistort frames first")
     parser.add_argument(
         "--segmentation",
@@ -83,7 +92,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     detector = CardDetector(
-        CardDetectorConfig(
+        config_for_view(
+            args.view or default_view(args.source),
             segmentation=args.segmentation,
             min_threshold=args.min_threshold,
             min_area_fraction=args.min_area,

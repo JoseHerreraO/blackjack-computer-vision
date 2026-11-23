@@ -10,7 +10,10 @@ Examples::
     python scripts/track_cards.py --source data/samples/<folder> --fps 15
     python scripts/track_cards.py --source data/samples/<folder> --no-window --save out.mp4
 
-Needs ``scripts/download_card_recognizer.py`` (or ``--no-recognition``).
+The recogniser is the classical one by default (bag of words + SVM for the rank, NCC templates
+for the suit; train it with ``scripts/train_recognizer.py``), which is the one the course syllabus
+covers. ``--recognizer embedding`` uses the learned embedding recogniser instead, for comparison
+(needs ``scripts/download_card_recognizer.py``). ``--no-recognition`` only detects and tracks.
 Keys: space = pause / resume, r = reset, s = snapshot, q / Esc = quit.
 """
 
@@ -43,9 +46,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", default="bridge", help="bridge[:port], camera, video or images")
     parser.add_argument("--fps", type=float, help="nominal rate of an image folder")
     parser.add_argument(
-        "--recognizer", type=Path, default=Path("models/irfan-playing-card-detector")
+        "--recognizer",
+        choices=("classic", "embedding"),
+        default="classic",
+        help="classic: bag of words + SVM and NCC templates (syllabus); embedding: learned model",
     )
-    parser.add_argument("--threshold", type=float, default=0.70, help="min similarity (0.70)")
+    parser.add_argument(
+        "--model", type=Path, default=Path("data/models/recognizer.joblib"), help="classic model"
+    )
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        help="classic: weakest one-vs-one SVM margin to name a card (default 0.4)",
+    )
+    parser.add_argument(
+        "--embedding-model", type=Path, default=Path("models/irfan-playing-card-detector")
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=0.70, help="embedding: min similarity (0.70)"
+    )
     parser.add_argument("--no-recognition", action="store_true", help="detection and tracking only")
     parser.add_argument("--min-crops", type=int, default=5, help="frames before recognising (5)")
     parser.add_argument("--fuse", type=int, default=3, help="sharpest crops averaged (3)")
@@ -97,10 +116,25 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s"
     )
     recognizer = None
-    if not args.no_recognition:
+    if args.no_recognition:
+        pass
+    elif args.recognizer == "classic":
+        from blackjack_vision.vision_classic.recognition import CardRecognizer
+
+        if not args.model.is_file():
+            print(
+                f"Classic model not found: {args.model}. Train it with scripts/train_recognizer.py "
+                "or use --recognizer embedding / --no-recognition",
+                file=sys.stderr,
+            )
+            return 2
+        recognizer = CardRecognizer.load(args.model)
+        if args.min_confidence is not None:
+            recognizer.min_rank_confidence = args.min_confidence
+    else:
         from blackjack_vision.vision_dl.embedding_recognizer import EmbeddingRecognizer
 
-        recognizer = EmbeddingRecognizer.load(args.recognizer, threshold=args.threshold)
+        recognizer = EmbeddingRecognizer.load(args.embedding_model, threshold=args.threshold)
     config = CardDetectorConfig.for_glasses() if args.view == "glasses" else CardDetectorConfig()
     pipeline = CardPipeline(
         recognizer,

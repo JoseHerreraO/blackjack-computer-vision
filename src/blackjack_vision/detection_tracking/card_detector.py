@@ -155,6 +155,30 @@ class CardDetectorConfig:
         return cls(**{"foreshortening_default": 0.5, **overrides})
 
 
+VIEWS = ("glasses", "top")
+"""Camera views: the glasses looking down at the table, or a camera above it."""
+
+
+def default_view(source: object) -> str:
+    """``"glasses"`` for the glasses stream (``bridge[:port]``), ``"top"`` for anything else."""
+    return "glasses" if str(source).strip().lower().startswith("bridge") else "top"
+
+
+def config_for_view(view: str, **overrides: object) -> CardDetectorConfig:
+    """Detector settings for a camera view (see :data:`VIEWS`).
+
+    With the glasses a single card on the table gives no foreshortening estimate, so the
+    detector must start from the glasses' value (:meth:`CardDetectorConfig.for_glasses`);
+    with the default 1.0 an upright card comes out rotated by 90 degrees and a sideways one is
+    not found.
+    """
+    if view == "glasses":
+        return CardDetectorConfig.for_glasses(**overrides)
+    if view == "top":
+        return CardDetectorConfig(**overrides)
+    raise ValueError(f"Unknown view {view!r}, expected one of {VIEWS}")
+
+
 @dataclass(frozen=True, eq=False)
 class CardDetection:
     """One card found in a frame.

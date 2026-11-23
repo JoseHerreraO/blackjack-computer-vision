@@ -34,7 +34,13 @@ import cv2
 from blackjack_vision.calibration.camera_model import CameraModel
 from blackjack_vision.calibration.undistort import Undistorter
 from blackjack_vision.capture.sources import open_source
-from blackjack_vision.detection_tracking.card_detector import CardDetector, draw_detections
+from blackjack_vision.detection_tracking.card_detector import (
+    VIEWS,
+    CardDetector,
+    config_for_view,
+    default_view,
+    draw_detections,
+)
 from blackjack_vision.security.aces import (
     AceReader,
     DecoderEvent,
@@ -56,6 +62,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--source", required=True, help="camera index, video, bridge[:port]...")
+    parser.add_argument(
+        "--view",
+        choices=VIEWS,
+        help="glasses (table seen at an angle) or top (camera above the table); "
+        "glasses by default for --source bridge, top otherwise",
+    )
     parser.add_argument("--model", type=Path, required=True, help="trained recogniser (joblib)")
     parser.add_argument("--secret", default=os.environ.get("BJ_SECRET"), help="e.g. SHDC")
     parser.add_argument("--camera", type=Path, help="camera model JSON to undistort frames")
@@ -86,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
             parse_secret(args.secret), min_frames=args.min_frames, timeout=args.timeout
         ),
     )
-    detector = CardDetector()
+    detector = CardDetector(config_for_view(args.view or default_view(args.source)))
     camera = CameraModel.load(args.camera) if args.camera else None
     undistorter: Undistorter | None = None
 
