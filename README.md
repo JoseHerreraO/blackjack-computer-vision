@@ -42,8 +42,8 @@ The phone does no vision processing at all. It only acts as a bridge between the
 | Capture | Meta glasses camera through the Wearables Device Access Toolkit (up to 720p at 30 FPS, limited by Bluetooth bandwidth). The phone app forwards the frames to the computer over the local network. Fallback with a fixed overhead webcam plugged into the computer |
 | Calibration | Chessboard photographed with the glasses themselves at the stream resolution. `findChessboardCorners` + `cornerSubPix` + `calibrateCamera` (offline). Precomputed `initUndistortRectifyMap` maps |
 | Card detection | Otsu / HSV, morphology, `findContours`, `approxPolyDP` (4 vertices, aspect ratio ≈ 1.4), homography to 200×300 |
-| Security | Suit of the ace's central pip by colour (HSV) and shape (Hu moments). Decoder for 4 patterns with reset on error, timeout or key press |
-| Recognition | Rank: bag of visual words (dense RootSIFT on the rectified card, K-Means vocabulary, spatial pyramid) + SVM with χ² kernel. Suit: red/black from the ink of the index corners, then the shape of the index suit symbol (Hu moments, solidity, width profile) + SVM. Temporal voting over N frames |
+| Security | Ace = exactly one pip in the card body (Otsu threshold + connected components), or the recogniser's rank. Suit by colour (HSV) and template matching (NCC) of the pip and index symbols. Decoder for 4 aces with reset on error, timeout or key press (see `docs/security.md`) |
+| Recognition | Rank: bag of visual words (dense RootSIFT on the rectified card, K-Means vocabulary, spatial pyramid) + SVM with χ² kernel. Suit: red/black from the share of red ink on the card (HSV), then template matching (NCC) of the index suit symbol against one template per suit. Temporal voting over N frames |
 | Tracker | IDs by centroid association + Kalman filter (cards), CamShift (chips) |
 | Game | Round state machine and basic strategy tables (hard, soft, pairs) |
 | Extensions | Hi-Lo (running and true count, edge, bet sizing), shoe histogram, CSV log, vocabulary/kernel study and BoW vs. template matching comparison |

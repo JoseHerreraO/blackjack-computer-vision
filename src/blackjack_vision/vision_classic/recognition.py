@@ -8,11 +8,12 @@
   the face-card artwork tell the 13 ranks apart (what Blackjack and the Hi-Lo count need). The
   detector cannot tell which short side of a card is the top, so every training card is also
   used rotated by 180 degrees.
-* **Suit**: colour, then shape. The fraction of red ink in the index corners decides whether the
-  suit is red or black, and the shape of the suit symbol under the rank
-  (:mod:`blackjack_vision.vision_classic.suit_shape`) picks one of the two suits of that colour.
-  In a bag of words the small symbol is diluted among the pips, which confuses spades with clubs
-  and hearts with diamonds.
+* **Suit**: colour, then template matching (Tema 3). The fraction of red ink on the card (HSV,
+  Tema 2; see :func:`card_colour`, face cards excepted) decides whether the suit is red or black, and the normalised cross-correlation of
+  the suit symbol under the rank with one template per suit
+  (:mod:`blackjack_vision.vision_classic.suit_templates`) picks one of the two suits of that
+  colour. In a bag of words the small symbol is diluted among the pips, which confuses spades
+  with clubs and hearts with diamonds.
 
 A single frame can still be wrong (blur, glare), so per-card predictions are meant to be smoothed
 over time with :class:`TemporalVoter` once the tracker assigns stable IDs.
@@ -41,12 +42,21 @@ from blackjack_vision.vision_classic.features import (
     SiftExtractor,
     Vocabulary,
 )
-from blackjack_vision.vision_classic.suit_shape import SuitShapeClassifier
+from blackjack_vision.vision_classic.suit_templates import SuitTemplates, corner_symbols, ink_mask
 
 logger = logging.getLogger(__name__)
 
-MODEL_FORMAT_VERSION = 1
-RED_INK_THRESHOLD = 0.25
+MODEL_FORMAT_VERSION = 2
+RED_INK_THRESHOLD = 0.45
+"""Share of red ink above which a card is red. Real red ink from the glasses is orange-ish and
+pale; on the 18/11 recording red cards measured 0.59-0.80 and black ones 0.00-0.30."""
+RED_HUE_MAX = 20
+RED_HUE_MIN = 165
+RED_MIN_SATURATION = 45
+CARD_MARGIN = 0.04
+"""Border of the rectified card left out of colour measurements (table pixels may leak in)."""
+PICTURE_SIZE = 0.5
+"""A blob wider and taller than this fraction of the card body is a face-card picture."""
 INDEX_REGION = (0.22, 0.32)
 """Width and height of each index corner, as fractions of the card."""
 
@@ -62,7 +72,6 @@ class RecognizerConfig:
         vocabulary_size: Number of visual words.
         pyramid_levels: Grid sides of the spatial pyramid.
         svm_c: Regularisation constant of the rank SVM.
-        suit_c: Regularisation constant of the suit shape SVM.
         index_region: Width and height of an index corner, as fractions of the card.
         augment_rotation: Also train the rank SVM on every card rotated by 180 degrees.
         colour_filter: Restrict the suit to the colour of the ink in the index corners.
@@ -74,7 +83,6 @@ class RecognizerConfig:
     vocabulary_size: int = 300
     pyramid_levels: tuple[int, ...] = (1, 2, 4)
     svm_c: float = 10.0
-    suit_c: float = 10.0
     index_region: tuple[float, float] = INDEX_REGION
     augment_rotation: bool = True
     colour_filter: bool = True
@@ -84,8 +92,8 @@ class RecognizerConfig:
     def __post_init__(self) -> None:
         if self.vocabulary_size < 2:
             raise ValueError("vocabulary_size must be at least 2")
-        if self.svm_c <= 0 or self.suit_c <= 0:
-            raise ValueError("svm_c and suit_c must be positive")
+        if self.svm_c <= 0:
+            raise ValueError("svm_c must be positive")
         width, height = self.index_region
         if not (0 < width <= 0.5 and 0 < height <= 0.5):
             raise ValueError(f"Invalid index_region {self.index_region}")
@@ -122,7 +130,7 @@ class Prediction:
         suit: Most likely suit, ``None`` if no suit symbol could be read.
         rank_margin: Score gap between the best and the second-best rank (higher = surer).
         suit_margin: Score gap between the best and the second-best allowed suit.
-        red_ink: Fraction of red ink in the index corners.
+        red_ink: Fraction of the ink of the card that is red (face-card picture left out).
     """
 
     rank: Rank
@@ -199,14 +207,14 @@ class CardRecognizer:
         self.extractor = SiftExtractor(self.config.features)
         self.encoder: BowEncoder | None = None
         self.rank_svm: Chi2SVM | None = None
-        self.suit_classifier: SuitShapeClassifier | None = None
+        self.suit_templates: SuitTemplates | None = None
 
     @property
     def is_trained(self) -> bool:
-        return self.rank_svm is not None and self.suit_classifier is not None
+        return self.rank_svm is not None and self.suit_templates is not None
 
     def fit(self, images: Sequence[np.ndarray], cards: Sequence[Card]) -> CardRecognizer:
-        """Train the vocabulary, the rank SVM and the suit shape classifier.
+        """Train the vocabulary, the rank SVM and the suit templates.
 
         Args:
             images: Rectified cards (BGR), e.g. the output of ``rectify_card``.
@@ -237,7 +245,7 @@ class CardRecognizer:
         self.encoder = BowEncoder(vocabulary, config.pyramid_levels, config.features.image_size)
         histograms = np.stack([self.encoder.encode(*f) for f in features])
         self.rank_svm = Chi2SVM(config.svm_c).fit(histograms, ranks)
-        self.suit_classifier = SuitShapeClassifier(config.suit_c).fit(
+        self.suit_templates = SuitTemplates().fit(
             [index_corners(image, config.index_region) for image in images],
             [card.suit for card in cards],
         )
@@ -267,23 +275,21 @@ class CardRecognizer:
             return []
         rank_scores = self.rank_svm.scores(np.stack([self.histogram(image) for image in images]))
         rank_classes = self.rank_svm.classes
-        suit_classes = self.suit_classifier.classes
-        red_suits = np.array([Suit(code).is_red for code in suit_classes])
-        both_colours = red_suits.any() and (~red_suits).any()
+        known = self.suit_templates.suits
+        both_colours = any(s.is_red for s in known) and any(not s.is_red for s in known)
 
         predictions = []
         for image, scores in zip(images, rank_scores, strict=True):
             rank_index, rank_margin = _best(scores)
             corners = index_corners(image, self.config.index_region)
-            red_ink = red_ink_fraction(image, self.config.index_region)
-            suit, suit_margin = None, 0.0
-            suit_scores = self.suit_classifier.scores(corners)
-            if suit_scores is not None:
-                if self.config.colour_filter and both_colours:
-                    allowed = red_suits if red_ink >= RED_INK_THRESHOLD else ~red_suits
-                    suit_scores = np.where(allowed, suit_scores, -np.inf)
-                suit_index, suit_margin = _best(suit_scores)
-                suit = Suit(suit_classes[suit_index])
+            red_ink = red_ink_fraction(image)
+            colour = card_colour(image)
+            allowed = None
+            if self.config.colour_filter and both_colours and colour is not None:
+                allowed = [s for s in known if s.is_red == colour]
+            suit, suit_margin = self.suit_templates.classify(
+                corner_symbols(corners), allowed=allowed
+            )
             predictions.append(
                 Prediction(Rank(rank_classes[rank_index]), suit, rank_margin, suit_margin, red_ink)
             )
@@ -300,7 +306,7 @@ class CardRecognizer:
             "config": self.config.to_dict(),
             "words": self.encoder.vocabulary.words,
             "rank_svm": self.rank_svm,
-            "suit_classifier": self.suit_classifier,
+            "suit_templates": self.suit_templates,
         }
         joblib.dump(state, path, compress=3)
         return path
@@ -320,7 +326,7 @@ class CardRecognizer:
             Vocabulary(state["words"]), config.pyramid_levels, config.features.image_size
         )
         recognizer.rank_svm = state["rank_svm"]
-        recognizer.suit_classifier = state["suit_classifier"]
+        recognizer.suit_templates = state["suit_templates"]
         return recognizer
 
 
@@ -337,21 +343,75 @@ def index_corners(card: np.ndarray, region: tuple[float, float] = INDEX_REGION) 
     return [top_left, bottom_right]
 
 
-def red_ink_fraction(card: np.ndarray, region: tuple[float, float] = INDEX_REGION) -> float:
-    """Fraction of the ink in the two index corners of a rectified card that is red.
+def _body(card: np.ndarray, margin: float) -> np.ndarray:
+    height, width = card.shape[:2]
+    dy, dx = int(margin * height), int(margin * width)
+    return card[dy : height - dy, dx : width - dx]
 
-    Only the index corners are used (they hold the rank and suit symbol in every deck), because
-    the artwork of face cards mixes colours. Paper pixels (bright and unsaturated) are not ink.
+
+def picture_box(card: np.ndarray, margin: float = CARD_MARGIN) -> tuple[int, int, int, int] | None:
+    """Bounding box ``(x, y, w, h)`` of a face-card picture in the card body, or ``None``.
+
+    The ink of the body is thresholded with Otsu and split into connected components; a component
+    wider and taller than ``PICTURE_SIZE`` of the body is the picture (or its frame). Coordinates
+    are relative to the body (the card without its ``margin``).
+    """
+    if card.ndim != 3:
+        return None
+    ink = ink_mask(_body(card, margin), upscale=1)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(ink)
+    height, width = ink.shape
+    boxes = [
+        stats[label, :4]
+        for label in range(1, count)
+        if stats[label, 2] > PICTURE_SIZE * width and stats[label, 3] > PICTURE_SIZE * height
+    ]
+    if not boxes:
+        return None
+    x0 = min(int(b[0]) for b in boxes)
+    y0 = min(int(b[1]) for b in boxes)
+    x1 = max(int(b[0] + b[2]) for b in boxes)
+    y1 = max(int(b[1] + b[3]) for b in boxes)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def red_ink_fraction(card: np.ndarray, margin: float = CARD_MARGIN) -> float:
+    """Fraction of the ink of a rectified card that is red (HSV, Tema 2).
+
+    Ink pixels are found with Otsu's threshold on the minimum of the B, G and R channels (dark for
+    ink of any colour). A pixel is red when its hue is within ``RED_HUE_MAX`` of red and its
+    saturation is at least ``RED_MIN_SATURATION``. The whole card body is used, not only the index
+    corners: in the glasses video the indices are small and pale, and real red ink is more orange
+    and less saturated than a pure red. The picture of a face card (:func:`picture_box`) is left
+    out, because its artwork has red and yellow in black cards too.
     """
     if card.ndim != 3:
         return 0.0
-    pixels = np.concatenate([corner.reshape(-1, 3) for corner in index_corners(card, region)])
-    hsv = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    hue, saturation, value = (hsv[:, i].astype(int) for i in range(3))
-    ink = (value < 160) | (saturation > 80)
-    red = ((hue <= 10) | (hue >= 170)) & (saturation >= 90) & (value >= 50)
+    body = _body(card, margin)
+    ink = ink_mask(body, upscale=1) > 0
+    box = picture_box(card, margin)
+    if box is not None:
+        x, y, w, h = box
+        ink[y : y + h, x : x + w] = False
+    hsv = cv2.cvtColor(body, cv2.COLOR_BGR2HSV)
+    hue, saturation = hsv[..., 0].astype(int), hsv[..., 1].astype(int)
+    red = ((hue <= RED_HUE_MAX) | (hue >= RED_HUE_MIN)) & (saturation >= RED_MIN_SATURATION)
     count = int(ink.sum())
     return float((red & ink).sum() / count) if count else 0.0
+
+
+def card_colour(card: np.ndarray, margin: float = CARD_MARGIN) -> bool | None:
+    """``True`` for a red card, ``False`` for a black one, ``None`` when it cannot be told.
+
+    Number cards and aces are decided by :func:`red_ink_fraction`. For a face card the colour is
+    reported as unknown: once the picture is left out only the index corners remain, and in the
+    glasses video their pale red ink reads as red for some red cards and not for others (0.00-0.39
+    on the 18/11 recording). The suit of a face card is then chosen among the four suits by the
+    shape of its index symbol alone.
+    """
+    if picture_box(card, margin) is not None:
+        return None
+    return red_ink_fraction(card, margin) >= RED_INK_THRESHOLD
 
 
 def load_dataset(folder: str | Path) -> tuple[list[np.ndarray], list[Card], list[Path]]:

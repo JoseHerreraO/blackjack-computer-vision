@@ -16,7 +16,9 @@ from blackjack_vision.vision_classic.recognition import (
     CardRecognizer,
     RecognizerConfig,
     TemporalVoter,
+    card_colour,
     load_dataset,
+    picture_box,
     red_ink_fraction,
 )
 
@@ -88,11 +90,17 @@ def test_training_needs_several_ranks_and_suits():
         CardRecognizer(FAST).fit(faces, [Card(Rank.ACE, Suit.SPADES)])
 
 
-def test_red_ink_is_measured_on_the_index_corners():
+def test_red_ink_and_card_colour():
     assert red_ink_fraction(card_face(Card(Rank.FIVE, Suit.HEARTS))) > 0.8
     assert red_ink_fraction(card_face(Card(Rank.FIVE, Suit.CLUBS))) < 0.05
-    # The red/yellow frame of a black king is in the middle, not in the corners.
-    assert red_ink_fraction(card_face(Card(Rank.KING, Suit.SPADES))) < 0.05
+    assert card_colour(card_face(Card(Rank.FIVE, Suit.HEARTS))) is True
+    assert card_colour(card_face(Card(Rank.ACE, Suit.SPADES))) is False
+    # Face cards: the picture is left out of the measurement and the colour is not decided.
+    for code in ("KS", "QH"):
+        face = card_face(Card.parse(code))
+        assert picture_box(face) is not None
+        assert card_colour(face) is None
+    assert picture_box(card_face(Card(Rank.NINE, Suit.CLUBS))) is None
 
 
 def test_dense_extractor_gives_a_fixed_number_of_descriptors():
