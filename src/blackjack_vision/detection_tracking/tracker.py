@@ -96,6 +96,9 @@ class Track:
     age: int = 1
     confirmed: bool = False
     _votes: deque[tuple[str, float]] = field(default_factory=deque, repr=False)
+    last_detection: Detection | None = field(default=None, repr=False)
+    """Detection matched to this track in its last update (the one of this frame when
+    ``missed == 0``), so callers can get back data the tracker does not use, such as corners."""
 
     def __post_init__(self) -> None:
         self._votes = deque(self._votes, maxlen=self.label_window)
@@ -123,6 +126,7 @@ class Track:
 
     def vote(self, detection: Detection) -> None:
         self._votes.append((detection.label, detection.confidence))
+        self.last_detection = detection
 
 
 @dataclass
