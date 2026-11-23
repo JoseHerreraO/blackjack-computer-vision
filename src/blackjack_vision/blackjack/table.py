@@ -154,7 +154,10 @@ class Table:
 
         if not visible:
             self._empty_frames += 1
-            if self._empty_frames == self.clear_frames and self._round_has_cards():
+            # Checked on every empty frame from clear_frames on (not only the first): the view may
+            # come back to an empty mat only after looking away. A new round has no cards, so it
+            # does not repeat.
+            if self._empty_frames >= self.clear_frames and self._round_has_cards():
                 if self.round.phase is Phase.FINISHED:
                     self._new_round(update, "table cleared after the round")
                 elif mat_in_view:

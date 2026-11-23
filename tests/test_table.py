@@ -232,3 +232,32 @@ def test_empty_table_after_the_round_ended_starts_a_new_round_even_without_the_m
     for _ in range(15):
         table.update([], [], HEIGHT, mat_in_view=None)
     assert table.rounds_played == 1
+
+
+def test_mat_seen_empty_after_looking_away_starts_a_new_round():
+    # Review of #25: the cards are collected while the player looks away, then the player looks
+    # back at an empty mat. The old round must close before the next round's cards arrive.
+    table = Table(clear_frames=15)
+    up, a, b = seen_at(1, "TC", 150, 300), seen_at(2, "TS", 550, 250), seen_at(3, "6D", 550, 350)
+    table.update([up, a, b], [up, a, b], 720)  # dealer TC, player TS 6D: 16
+    for _ in range(20):
+        table.update([], [], 720, mat_in_view=False)  # looking away
+    for _ in range(20):
+        table.update([], [], 720, mat_in_view=True)  # back: empty mat
+    assert table.rounds_played == 1 and not table.round.hands[0].cards
+    n1, n2, n3 = (
+        seen_at(10, "5C", 550, 250),
+        seen_at(11, "KD", 150, 300),
+        seen_at(12, "7H", 550, 350),
+    )
+    table.update([n1, n2, n3], [n1, n2, n3], 720)
+    assert [card.code for card in table.round.hands[0].cards] == ["5C", "7H"]
+    assert [card.code for card in table.round.dealer.cards] == ["KD"]
+
+
+def test_new_round_from_an_empty_view_happens_once():
+    table = Table(clear_frames=3)
+    deal(table, player("TH"), dealer("5C"), player("QD"))
+    for _ in range(10):
+        table.update([], [], HEIGHT, mat_in_view=True)
+    assert table.rounds_played == 1
