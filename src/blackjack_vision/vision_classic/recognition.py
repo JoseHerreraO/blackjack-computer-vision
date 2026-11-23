@@ -9,7 +9,7 @@
   detector cannot tell which short side of a card is the top, so every training card is also
   used rotated by 180 degrees.
 * **Suit**: colour, then template matching (Tema 3). The fraction of red ink on the card (HSV,
-  Tema 2) decides whether the suit is red or black, and the normalised cross-correlation of
+  Tema 2; see :func:`card_colour`, face cards excepted) decides whether the suit is red or black, and the normalised cross-correlation of
   the suit symbol under the rank with one template per suit
   (:mod:`blackjack_vision.vision_classic.suit_templates`) picks one of the two suits of that
   colour. In a bag of words the small symbol is diluted among the pips, which confuses spades
@@ -55,6 +55,8 @@ RED_HUE_MIN = 165
 RED_MIN_SATURATION = 45
 CARD_MARGIN = 0.04
 """Border of the rectified card left out of colour measurements (table pixels may leak in)."""
+PICTURE_SIZE = 0.5
+"""A blob wider and taller than this fraction of the card body is a face-card picture."""
 INDEX_REGION = (0.22, 0.32)
 """Width and height of each index corner, as fractions of the card."""
 
@@ -128,7 +130,7 @@ class Prediction:
         suit: Most likely suit, ``None`` if no suit symbol could be read.
         rank_margin: Score gap between the best and the second-best rank (higher = surer).
         suit_margin: Score gap between the best and the second-best allowed suit.
-        red_ink: Fraction of the ink of the card that is red.
+        red_ink: Fraction of the ink of the card that is red (face-card picture left out).
     """
 
     rank: Rank
@@ -281,10 +283,10 @@ class CardRecognizer:
             rank_index, rank_margin = _best(scores)
             corners = index_corners(image, self.config.index_region)
             red_ink = red_ink_fraction(image)
+            colour = card_colour(image)
             allowed = None
-            if self.config.colour_filter and both_colours:
-                red = red_ink >= RED_INK_THRESHOLD
-                allowed = [s for s in known if s.is_red == red]
+            if self.config.colour_filter and both_colours and colour is not None:
+                allowed = [s for s in known if s.is_red == colour]
             suit, suit_margin = self.suit_templates.classify(
                 corner_symbols(corners), allowed=allowed
             )
@@ -341,6 +343,38 @@ def index_corners(card: np.ndarray, region: tuple[float, float] = INDEX_REGION) 
     return [top_left, bottom_right]
 
 
+def _body(card: np.ndarray, margin: float) -> np.ndarray:
+    height, width = card.shape[:2]
+    dy, dx = int(margin * height), int(margin * width)
+    return card[dy : height - dy, dx : width - dx]
+
+
+def picture_box(card: np.ndarray, margin: float = CARD_MARGIN) -> tuple[int, int, int, int] | None:
+    """Bounding box ``(x, y, w, h)`` of a face-card picture in the card body, or ``None``.
+
+    The ink of the body is thresholded with Otsu and split into connected components; a component
+    wider and taller than ``PICTURE_SIZE`` of the body is the picture (or its frame). Coordinates
+    are relative to the body (the card without its ``margin``).
+    """
+    if card.ndim != 3:
+        return None
+    ink = ink_mask(_body(card, margin), upscale=1)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(ink)
+    height, width = ink.shape
+    boxes = [
+        stats[label, :4]
+        for label in range(1, count)
+        if stats[label, 2] > PICTURE_SIZE * width and stats[label, 3] > PICTURE_SIZE * height
+    ]
+    if not boxes:
+        return None
+    x0 = min(int(b[0]) for b in boxes)
+    y0 = min(int(b[1]) for b in boxes)
+    x1 = max(int(b[0] + b[2]) for b in boxes)
+    y1 = max(int(b[1] + b[3]) for b in boxes)
+    return x0, y0, x1 - x0, y1 - y0
+
+
 def red_ink_fraction(card: np.ndarray, margin: float = CARD_MARGIN) -> float:
     """Fraction of the ink of a rectified card that is red (HSV, Tema 2).
 
@@ -348,19 +382,36 @@ def red_ink_fraction(card: np.ndarray, margin: float = CARD_MARGIN) -> float:
     ink of any colour). A pixel is red when its hue is within ``RED_HUE_MAX`` of red and its
     saturation is at least ``RED_MIN_SATURATION``. The whole card body is used, not only the index
     corners: in the glasses video the indices are small and pale, and real red ink is more orange
-    and less saturated than a pure red.
+    and less saturated than a pure red. The picture of a face card (:func:`picture_box`) is left
+    out, because its artwork has red and yellow in black cards too.
     """
     if card.ndim != 3:
         return 0.0
-    height, width = card.shape[:2]
-    dy, dx = int(margin * height), int(margin * width)
-    body = card[dy : height - dy, dx : width - dx]
+    body = _body(card, margin)
     ink = ink_mask(body, upscale=1) > 0
+    box = picture_box(card, margin)
+    if box is not None:
+        x, y, w, h = box
+        ink[y : y + h, x : x + w] = False
     hsv = cv2.cvtColor(body, cv2.COLOR_BGR2HSV)
     hue, saturation = hsv[..., 0].astype(int), hsv[..., 1].astype(int)
     red = ((hue <= RED_HUE_MAX) | (hue >= RED_HUE_MIN)) & (saturation >= RED_MIN_SATURATION)
     count = int(ink.sum())
     return float((red & ink).sum() / count) if count else 0.0
+
+
+def card_colour(card: np.ndarray, margin: float = CARD_MARGIN) -> bool | None:
+    """``True`` for a red card, ``False`` for a black one, ``None`` when it cannot be told.
+
+    Number cards and aces are decided by :func:`red_ink_fraction`. For a face card the colour is
+    reported as unknown: once the picture is left out only the index corners remain, and in the
+    glasses video their pale red ink reads as red for some red cards and not for others (0.00-0.39
+    on the 18/11 recording). The suit of a face card is then chosen among the four suits by the
+    shape of its index symbol alone.
+    """
+    if picture_box(card, margin) is not None:
+        return None
+    return red_ink_fraction(card, margin) >= RED_INK_THRESHOLD
 
 
 def load_dataset(folder: str | Path) -> tuple[list[np.ndarray], list[Card], list[Path]]:

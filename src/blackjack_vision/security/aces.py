@@ -32,7 +32,7 @@ import numpy as np
 from blackjack_vision.blackjack.cards import Rank, Suit
 from blackjack_vision.vision_classic.recognition import (
     INDEX_REGION,
-    RED_INK_THRESHOLD,
+    card_colour,
     index_corners,
     red_ink_fraction,
 )
@@ -153,9 +153,9 @@ class AceReader:
 
         known = self.templates.suits
         allowed = None
-        if any(s.is_red for s in known) and any(not s.is_red for s in known):
-            red = red_ink >= RED_INK_THRESHOLD
-            allowed = [s for s in known if s.is_red == red]
+        colour = card_colour(card)
+        if colour is not None and any(s.is_red for s in known) and any(not s.is_red for s in known):
+            allowed = [s for s in known if s.is_red == colour]
         scores: dict[Suit, float] = dict.fromkeys(allowed or known, 0.0)
         if pip is not None:
             pip_scores = self.templates.scores(
