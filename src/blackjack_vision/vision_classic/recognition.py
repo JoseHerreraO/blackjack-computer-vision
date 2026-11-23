@@ -25,6 +25,7 @@ import logging
 from collections import Counter, deque
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -59,6 +60,11 @@ PICTURE_SIZE = 0.5
 """A blob wider and taller than this fraction of the card body is a face-card picture."""
 INDEX_REGION = (0.22, 0.32)
 """Width and height of each index corner, as fractions of the card."""
+MIN_RANK_CONFIDENCE = 0.4
+"""Weakest one-vs-one SVM margin of the winning rank below which :meth:`CardRecognizer.recognise`
+reports the card as unknown. On the synthetic cards every wrong rank stayed below 0.32."""
+MIN_SUIT_MARGIN = 0.02
+"""NCC score gap between the two best suits below which the suit is considered unsure."""
 
 T = TypeVar("T", bound=Hashable)
 
@@ -131,6 +137,9 @@ class Prediction:
         rank_margin: Score gap between the best and the second-best rank (higher = surer).
         suit_margin: Score gap between the best and the second-best allowed suit.
         red_ink: Fraction of the ink of the card that is red (face-card picture left out).
+        rank_confidence: Smallest one-vs-one SVM margin between the winning rank and every other
+            rank (see :meth:`Chi2SVM.weakest_duel`). It measures how clearly the rank wins its
+            closest duel; ``rank_margin`` only counts votes and is about 1 for most cards.
     """
 
     rank: Rank
@@ -138,11 +147,31 @@ class Prediction:
     rank_margin: float
     suit_margin: float
     red_ink: float
+    rank_confidence: float = 0.0
 
     @property
     def card(self) -> Card | None:
         """The full card, or ``None`` if the suit is unknown."""
         return Card(self.rank, self.suit) if self.suit is not None else None
+
+
+@dataclass(frozen=True)
+class ClassicRecognition:
+    """Result of :meth:`CardRecognizer.recognise` (same fields the card pipeline reads).
+
+    Attributes:
+        card: The card, or ``None`` when the recogniser is not sure.
+        similarity: Confidence of the rank (its weakest one-vs-one SVM margin); not a cosine.
+        prediction: The full prediction, for logging and evaluation.
+    """
+
+    card: Card | None
+    similarity: float
+    prediction: Prediction
+
+    @property
+    def known(self) -> bool:
+        return self.card is not None
 
 
 class Chi2SVM:
@@ -180,8 +209,7 @@ class Chi2SVM:
         self.train = histograms[self.svm.support_].astype(np.float32)
         return self
 
-    def scores(self, histograms: np.ndarray) -> np.ndarray:
-        """One-vs-rest scores ``(n_samples, n_classes)``, columns ordered as :attr:`classes`."""
+    def _kernel(self, histograms: np.ndarray) -> np.ndarray:
         if self.svm is None:
             raise RuntimeError("The SVM is not trained")
         histograms = np.asarray(histograms, np.float64)
@@ -189,10 +217,47 @@ class Chi2SVM:
         kernel[:, self.svm.support_] = chi2_kernel(
             histograms, self.train.astype(np.float64), gamma=self.gamma
         )
+        return kernel
+
+    def scores(self, histograms: np.ndarray) -> np.ndarray:
+        """One-vs-rest scores ``(n_samples, n_classes)``, columns ordered as :attr:`classes`."""
+        kernel = self._kernel(histograms)
         scores = self.svm.decision_function(kernel)
         if scores.ndim == 1:  # binary problem: a single signed distance
             scores = np.column_stack([-scores, scores])
         return scores
+
+    def weakest_duel(self, histograms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Winning class of every sample and the margin of its closest one-vs-one duel.
+
+        A multi-class SVM is a set of one-vs-one SVMs, one per pair of classes. The predicted
+        class wins most duels; the smallest signed decision value between it and every other
+        class says how clearly it wins: negative if it lost a duel, close to 0 when another class
+        is almost as good, large when it beats all of them comfortably.
+
+        Returns:
+            Labels ``(n_samples,)`` and margins ``(n_samples,)``.
+        """
+        if self.svm is None:
+            raise RuntimeError("The SVM is not trained")
+        kernel = self._kernel(histograms)
+        labels = self.svm.predict(kernel)
+        self.svm.decision_function_shape = "ovo"
+        try:
+            values = self.svm.decision_function(kernel)
+        finally:
+            self.svm.decision_function_shape = "ovr"
+        values = np.asarray(values).reshape(len(kernel), -1)
+        classes = list(self.svm.classes_)
+        n = len(classes)
+        margins = np.empty(len(kernel))
+        for row, (label, duels) in enumerate(zip(labels, values, strict=True)):
+            pairwise = np.zeros((n, n))
+            for k, (i, j) in enumerate(combinations(range(n), 2)):
+                pairwise[i, j], pairwise[j, i] = duels[k], -duels[k]
+            winner = classes.index(label)
+            margins[row] = min(pairwise[winner, j] for j in range(n) if j != winner)
+        return labels, margins
 
 
 class CardRecognizer:
@@ -208,6 +273,8 @@ class CardRecognizer:
         self.encoder: BowEncoder | None = None
         self.rank_svm: Chi2SVM | None = None
         self.suit_templates: SuitTemplates | None = None
+        self.min_rank_confidence = MIN_RANK_CONFIDENCE
+        self.min_suit_margin = MIN_SUIT_MARGIN
 
     @property
     def is_trained(self) -> bool:
@@ -273,14 +340,17 @@ class CardRecognizer:
             raise RuntimeError("The recognizer is not trained")
         if len(images) == 0:
             return []
-        rank_scores = self.rank_svm.scores(np.stack([self.histogram(image) for image in images]))
-        rank_classes = self.rank_svm.classes
+        histograms = np.stack([self.histogram(image) for image in images])
+        rank_scores = self.rank_svm.scores(histograms)
+        rank_labels, rank_confidences = self.rank_svm.weakest_duel(histograms)
         known = self.suit_templates.suits
         both_colours = any(s.is_red for s in known) and any(not s.is_red for s in known)
 
         predictions = []
-        for image, scores in zip(images, rank_scores, strict=True):
-            rank_index, rank_margin = _best(scores)
+        for image, scores, label, confidence in zip(
+            images, rank_scores, rank_labels, rank_confidences, strict=True
+        ):
+            _, rank_margin = _best(scores)
             corners = index_corners(image, self.config.index_region)
             red_ink = red_ink_fraction(image)
             colour = card_colour(image)
@@ -291,9 +361,27 @@ class CardRecognizer:
                 corner_symbols(corners), allowed=allowed
             )
             predictions.append(
-                Prediction(Rank(rank_classes[rank_index]), suit, rank_margin, suit_margin, red_ink)
+                Prediction(Rank(label), suit, rank_margin, suit_margin, red_ink, float(confidence))
             )
         return predictions
+
+    def recognise(self, image: np.ndarray) -> ClassicRecognition:
+        """Name one rectified card, or report it as unknown when the evidence is weak.
+
+        Same interface as the embedding recogniser, so the real-time ``CardPipeline`` can use
+        either: ``card`` is ``None`` when the rank's weakest one-vs-one margin is below
+        :attr:`min_rank_confidence`, or the suit is missing or its NCC margin is below
+        :attr:`min_suit_margin`. The pipeline then tries again with fresher crops.
+        """
+        prediction = self.predict(image)
+        sure = (
+            prediction.card is not None
+            and prediction.rank_confidence >= self.min_rank_confidence
+            and prediction.suit_margin >= self.min_suit_margin
+        )
+        return ClassicRecognition(
+            prediction.card if sure else None, prediction.rank_confidence, prediction
+        )
 
     def save(self, path: str | Path) -> Path:
         """Store the trained model (``joblib`` file), creating parent folders if needed."""

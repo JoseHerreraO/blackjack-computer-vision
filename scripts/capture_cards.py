@@ -29,7 +29,13 @@ from blackjack_vision.blackjack.cards import FULL_DECK, Card
 from blackjack_vision.calibration.camera_model import CameraModel
 from blackjack_vision.calibration.undistort import Undistorter
 from blackjack_vision.capture.sources import open_source, write_image
-from blackjack_vision.detection_tracking.card_detector import CardDetector, draw_detections
+from blackjack_vision.detection_tracking.card_detector import (
+    VIEWS,
+    CardDetector,
+    config_for_view,
+    default_view,
+    draw_detections,
+)
 from blackjack_vision.vision_classic.rectify import rectify_card
 
 WINDOW = "capture cards"
@@ -42,7 +48,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--source", required=True, help="camera index, video file or stream URL")
+    parser.add_argument("--source", required=True, help="camera index, video file, bridge...")
+    parser.add_argument(
+        "--view",
+        choices=VIEWS,
+        help="glasses (table seen at an angle) or top (camera above the table); "
+        "glasses by default for --source bridge, top otherwise",
+    )
     labels = parser.add_mutually_exclusive_group(required=True)
     labels.add_argument("--label", help="card being captured, e.g. AS, TH, 10D, QC")
     labels.add_argument("--deck", action="store_true", help="walk through the 52 cards in order")
@@ -70,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         deck, position = [Card.parse(args.label)], 0
 
-    detector = CardDetector()
+    detector = CardDetector(config_for_view(args.view or default_view(args.source)))
     camera = CameraModel.load(args.camera) if args.camera else None
     undistorters: dict[tuple[int, int], Undistorter] = {}
     auto, since_last = False, 0

@@ -50,6 +50,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step", type=int, default=defaults.features.step)
     parser.add_argument("--c", type=float, default=defaults.svm_c, help="rank SVM C")
     parser.add_argument("--test-size", type=float, default=0.25, help="held-out fraction")
+    parser.add_argument(
+        "--test-data",
+        type=Path,
+        help="separate test folder (e.g. another recording): train on all of --data, test on it",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-refit", action="store_true", help="save the train-split model")
     parser.add_argument("--errors-dir", type=Path, help="save misrecognised test images here")
@@ -66,6 +71,49 @@ def confusion_table(true: list[str], predicted: list[str], labels: list[str]) ->
     return "\n".join(lines)
 
 
+def evaluate(recognizer, images, truth, paths, errors_dir: Path | None) -> None:
+    """Print accuracy, the rank confusion matrix and what ``recognise`` would leave unknown."""
+    start = time.perf_counter()
+    predictions = recognizer.predict_many(images)
+    per_card_ms = 1000 * (time.perf_counter() - start) / max(1, len(images))
+    rank_ok = np.array([p.rank == c.rank for p, c in zip(predictions, truth, strict=True)])
+    suit_ok = np.array([p.suit == c.suit for p, c in zip(predictions, truth, strict=True)])
+    card_ok = rank_ok & suit_ok
+    print(
+        f"Test ({len(images)} images, {per_card_ms:.1f} ms/card): "
+        f"rank {rank_ok.mean():.1%}  suit {suit_ok.mean():.1%}  card {card_ok.mean():.1%}"
+    )
+    known = np.array(
+        [
+            p.card is not None
+            and p.rank_confidence >= recognizer.min_rank_confidence
+            and p.suit_margin >= recognizer.min_suit_margin
+            for p in predictions
+        ]
+    )
+    if known.any():
+        print(
+            f"recognise() with min confidence {recognizer.min_rank_confidence}: "
+            f"{known.mean():.1%} named, {card_ok[known].mean():.1%} of them right, "
+            f"{(~known).sum()} left unknown"
+        )
+    print(
+        confusion_table(
+            [c.rank.value for c in truth],
+            [p.rank.value for p in predictions],
+            [rank.value for rank in Rank],
+        )
+    )
+    if errors_dir is not None:
+        for image, card, path, prediction, ok in zip(
+            images, truth, paths, predictions, card_ok, strict=True
+        ):
+            if not ok:
+                guess = prediction.card.code if prediction.card else f"{prediction.rank.value}?"
+                write_image(errors_dir / f"{card.code}_as_{guess}_{path.stem}.png", image)
+        print(f"Errors saved to {errors_dir}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -80,48 +128,38 @@ def main(argv: list[str] | None = None) -> int:
         svm_c=args.c,
         seed=args.seed,
     )
-    stratify = [card.code for card in cards] if min(per_card.values()) >= 2 else None
-    train_idx, test_idx = train_test_split(
-        np.arange(len(images)), test_size=args.test_size, random_state=args.seed, stratify=stratify
-    )
-
-    start = time.perf_counter()
-    recognizer = CardRecognizer(config).fit(
-        [images[i] for i in train_idx], [cards[i] for i in train_idx]
-    )
-    print(f"Training: {time.perf_counter() - start:.1f} s on {len(train_idx)} images")
-
-    start = time.perf_counter()
-    predictions = recognizer.predict_many([images[i] for i in test_idx])
-    per_card_ms = 1000 * (time.perf_counter() - start) / max(1, len(test_idx))
-    truth = [cards[i] for i in test_idx]
-    rank_ok = [p.rank == c.rank for p, c in zip(predictions, truth, strict=True)]
-    suit_ok = [p.suit == c.suit for p, c in zip(predictions, truth, strict=True)]
-    card_ok = [r and s for r, s in zip(rank_ok, suit_ok, strict=True)]
-    print(
-        f"Test ({len(test_idx)} images, {per_card_ms:.1f} ms/card): "
-        f"rank {np.mean(rank_ok):.1%}  suit {np.mean(suit_ok):.1%}  card {np.mean(card_ok):.1%}"
-    )
-    print(
-        confusion_table(
-            [c.rank.value for c in truth],
-            [p.rank.value for p in predictions],
-            [rank.value for rank in Rank],
-        )
-    )
-
-    if args.errors_dir is not None:
-        for index, prediction, ok in zip(test_idx, predictions, card_ok, strict=True):
-            if not ok:
-                guess = prediction.card.code if prediction.card else f"{prediction.rank.value}?"
-                name = f"{cards[index].code}_as_{guess}_{paths[index].stem}.png"
-                write_image(args.errors_dir / name, images[index])
-        print(f"Errors saved to {args.errors_dir}")
-
-    if not args.no_refit:
+    if args.test_data is not None:
+        test_images, test_cards, test_paths = load_dataset(args.test_data)
         start = time.perf_counter()
         recognizer = CardRecognizer(config).fit(images, cards)
-        print(f"Refit on all {len(images)} images: {time.perf_counter() - start:.1f} s")
+        print(f"Training: {time.perf_counter() - start:.1f} s on all {len(images)} images")
+        print(f"Test set: {len(test_images)} images from {args.test_data}")
+        evaluate(recognizer, test_images, test_cards, test_paths, args.errors_dir)
+    else:
+        stratify = [card.code for card in cards] if min(per_card.values()) >= 2 else None
+        train_idx, test_idx = train_test_split(
+            np.arange(len(images)),
+            test_size=args.test_size,
+            random_state=args.seed,
+            stratify=stratify,
+        )
+        start = time.perf_counter()
+        recognizer = CardRecognizer(config).fit(
+            [images[i] for i in train_idx], [cards[i] for i in train_idx]
+        )
+        print(f"Training: {time.perf_counter() - start:.1f} s on {len(train_idx)} images")
+        print("Test set: a random part of the same recording (optimistic, see --test-data)")
+        evaluate(
+            recognizer,
+            [images[i] for i in test_idx],
+            [cards[i] for i in test_idx],
+            [paths[i] for i in test_idx],
+            args.errors_dir,
+        )
+        if not args.no_refit:
+            start = time.perf_counter()
+            recognizer = CardRecognizer(config).fit(images, cards)
+            print(f"Refit on all {len(images)} images: {time.perf_counter() - start:.1f} s")
     print(f"Saved {recognizer.save(args.out)}")
     return 0
 
