@@ -87,7 +87,7 @@ class CardPipeline:
         recognizer: Names rectified cards. ``None`` keeps every card as ``"?"`` (detection and
             tracking only).
         detector: Classical card detector (a new one by default).
-        tracker: Card tracker (a new one by default).
+        tracker: Card tracker. By default IoU matching only (see the comment in ``__init__``).
         min_crops: Crops collected before the first recognition of a card.
         fuse_top: Sharpest crops averaged for recognition (``1`` = only the sharpest).
         buffer_size: Crops kept per card (the oldest are dropped).
@@ -113,7 +113,10 @@ class CardPipeline:
             raise ValueError("Need 1 <= fuse_top, min_crops <= buffer_size")
         self.recognizer = recognizer
         self.detector = detector or CardDetector()
-        self.tracker = tracker or CardTracker(min_hits=1)
+        # Every detection reaches the tracker as "?", so its second pass (same label and close
+        # centres) would hand a lost card's ID, and its name, to any nearby card. IoU only; a card
+        # that is lost and found again is recognised again, and the table does not recount it.
+        self.tracker = tracker or CardTracker(min_hits=1, max_center_distance=0.0)
         self.min_crops = min_crops
         self.fuse_top = fuse_top
         self.buffer_size = buffer_size
