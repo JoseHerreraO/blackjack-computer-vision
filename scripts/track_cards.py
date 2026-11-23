@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 from blackjack_vision.capture.sources import open_source, write_image
+from blackjack_vision.detection_tracking.card_detector import CardDetector, CardDetectorConfig
 from blackjack_vision.detection_tracking.pipeline import CardPipeline, PipelineResult
 
 WINDOW = "cards"
@@ -48,6 +49,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-recognition", action="store_true", help="detection and tracking only")
     parser.add_argument("--min-crops", type=int, default=5, help="frames before recognising (5)")
     parser.add_argument("--fuse", type=int, default=3, help="sharpest crops averaged (3)")
+    parser.add_argument(
+        "--view",
+        choices=("glasses", "top"),
+        default="glasses",
+        help="glasses: table seen at an angle (starts the foreshortening at 0.5), top: from above",
+    )
     parser.add_argument("--save", type=Path, help="write the annotated video to this file")
     parser.add_argument("--snapshots", type=Path, default=Path("outputs/track_cards"))
     parser.add_argument("--no-window", action="store_true", help="run without a preview window")
@@ -94,7 +101,13 @@ def main(argv: list[str] | None = None) -> int:
         from blackjack_vision.vision_dl.embedding_recognizer import EmbeddingRecognizer
 
         recognizer = EmbeddingRecognizer.load(args.recognizer, threshold=args.threshold)
-    pipeline = CardPipeline(recognizer, min_crops=args.min_crops, fuse_top=args.fuse)
+    config = CardDetectorConfig.for_glasses() if args.view == "glasses" else CardDetectorConfig()
+    pipeline = CardPipeline(
+        recognizer,
+        detector=CardDetector(config),
+        min_crops=args.min_crops,
+        fuse_top=args.fuse,
+    )
 
     writer: cv2.VideoWriter | None = None
     frame_times: deque[float] = deque(maxlen=30)
