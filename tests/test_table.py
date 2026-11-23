@@ -80,7 +80,7 @@ def test_count_carries_over_to_the_next_round():
     deal(table, player("TH"), dealer("KC"), player("QD"))  # three high cards: RC -3
     assert table.shoe.running_count == -3
     for _ in range(3):
-        update = table.update([], [], HEIGHT)
+        update = table.update([], [], HEIGHT, mat_in_view=True)  # cards collected
     assert any("New round" in event for event in update.events)
     assert table.round.dealer.cards == [] and table.rounds_played == 1
     assert table.shoe.running_count == -3
@@ -166,3 +166,69 @@ def test_two_equal_cards_in_view_are_two_cards():
     second.corners = second.corners + [150, 0]
     deal(table, second, visible=[first, second])  # both in view: several decks
     assert [card.code for card in table.round.hands[0].cards] == ["TH", "TH"]
+
+
+# Review of #25 -------------------------------------------------------------------------------
+
+
+def seen_at(track_id: int, code: str | None, y: float, x: float) -> Seen:
+    corners = np.array(
+        [[x - 30, y - 40], [x + 30, y - 40], [x + 30, y + 40], [x - 30, y + 40]], float
+    )
+    return Seen(corners, Card.parse(code) if code else None, track_id)
+
+
+def test_second_equal_card_after_a_refound_one_is_dealt():
+    table = Table()
+    up = seen_at(1, "9H", 150, 300)
+    p1, p2 = seen_at(2, "8S", 550, 250), seen_at(3, "3D", 550, 350)
+    table.update([up, p1, p2], [up, p1, p2], 720)  # player 8S 3D = 11
+    table.update([up, p2], [], 720)  # the 8S is covered: track 2 lost
+    p1b = seen_at(4, "8S", 550, 250)
+    update = table.update([up, p1b, p2], [p1b], 720)  # found again: not recounted
+    assert any("not recounted" in event for event in update.events)
+    hit = seen_at(5, "8S", 550, 450)
+    table.update([up, p1b, p2, hit], [hit], 720)  # a different 8S
+    hand = table.round.hands[0]
+    assert [card.code for card in hand.cards] == ["8S", "3D", "8S"] and hand.total == 19
+
+
+def test_lost_card_reappearing_far_away_is_a_new_card():
+    table = Table()
+    up = seen_at(1, "9H", 150, 300)
+    p1, p2 = seen_at(2, "8S", 550, 200), seen_at(3, "3D", 550, 300)
+    table.update([up, p1, p2], [up, p1, p2], 720)
+    table.update([up, p2], [], 720)  # 8S lost
+    far = seen_at(4, "8S", 650, 650)  # an 8S, but far from where the lost one was
+    table.update([up, p2, far], [far], 720)
+    assert len(table.round.hands[0]) == 3
+
+
+def test_looking_away_mid_round_keeps_the_hand():
+    table = Table(clear_frames=15)
+    up, a, b = seen_at(1, "TC", 150, 300), seen_at(2, "TS", 550, 250), seen_at(3, "6D", 550, 350)
+    table.update([up, a, b], [up, a, b], 720)  # player 16 against a ten
+    for _ in range(60):
+        table.update([], [], 720, mat_in_view=False)  # head turned away
+    assert table.round.phase is Phase.PLAYER_TURN and table.round.hands[0].total == 16
+    assert table.rounds_played == 0
+
+
+def test_empty_mat_mid_round_starts_a_new_round():
+    table = Table(clear_frames=15)
+    up, a, b = seen_at(1, "TC", 150, 300), seen_at(2, "TS", 550, 250), seen_at(3, "6D", 550, 350)
+    table.update([up, a, b], [up, a, b], 720)
+    for _ in range(15):
+        update = table.update([], [], 720, mat_in_view=True)  # cards collected, mat empty
+    assert any("New round" in event for event in update.events)
+    assert table.rounds_played == 1
+
+
+def test_empty_table_after_the_round_ended_starts_a_new_round_even_without_the_mat():
+    table = Table(clear_frames=15)
+    deal(table, player("TH"), dealer("5C"), player("QD"))
+    deal(table, dealer("KS"))
+    deal(table, dealer("TS"))  # dealer busts, round finished
+    for _ in range(15):
+        table.update([], [], HEIGHT, mat_in_view=None)
+    assert table.rounds_played == 1

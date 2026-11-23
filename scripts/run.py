@@ -56,6 +56,7 @@ from blackjack_vision.security.aces import (
     parse_secret,
 )
 from blackjack_vision.ui.hud import draw_hud
+from blackjack_vision.vision_classic.mat import mat_in_view
 from blackjack_vision.vision_classic.rectify import rectify_card
 
 WINDOW = "Blackjack assistant"
@@ -219,7 +220,11 @@ def main(argv: list[str] | None = None) -> int:
                     hud = draw_hud(image, cards, fps, lock_text=lock_text(system), locked=True)
                 else:
                     result = pipeline.process(image)
-                    update = table.update(result.cards, result.new_cards, image.shape[0])
+                    # Only needed when no card is seen: empty table, or head turned away?
+                    on_mat = mat_in_view(image) if not result.cards else None
+                    update = table.update(
+                        result.cards, result.new_cards, image.shape[0], mat_in_view=on_mat
+                    )
                     for event in update.events:
                         logger.info(event)
                     for phrase in update.speech:

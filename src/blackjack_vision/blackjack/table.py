@@ -14,11 +14,15 @@ What the table infers on its own:
   counted until it is turned over (then it is recognised and dealt like any other card).
 * **Re-found cards.** A card hidden for a while (by a hand, for instance) loses its track and
   comes back with a new one, so the pipeline names it again. If a card with the same code was
-  already dealt to the same zone in this round and its track is no longer in view, it is the same
-  card and is not dealt (or counted) twice. Two equal cards in view at the same time are two cards
-  (several decks).
-* **New round.** When the table stays empty for ``clear_frames`` frames, or a card appears after
-  the round finished, a new round starts. The shoe, and so the count, carries over.
+  already dealt to the same zone in this round, its track is no longer in view, and the new one
+  appears near where it was last seen (``refound_distance`` card sizes), it is the same card: it
+  is not dealt (or counted) twice and the dealt card takes over the new track, so a later equal
+  card is a new card. Two equal cards in view at the same time are two cards (several decks).
+* **New round.** A card after the round finished starts a new round. An empty view starts one
+  after ``clear_frames`` frames only when that cannot lose a hand: the round is over (or has no
+  cards), or the mat is in view and empty (the cards were collected). With the head turned away
+  (``mat_in_view=False``) the round waits for the cards to come back. The shoe, and so the count,
+  carries over.
 * **Advice.** Whenever the basic-strategy recommendation changes it is queued as speech (Spanish,
   e.g. "Pide carta"). When the round ends its result is spoken too.
 
@@ -84,7 +88,9 @@ class Table:
         dealer_line: Height of the line between the dealer's and the player's zone, as a
             fraction of the image height (cards above it are the dealer's).
         hidden_frames: Frames a dealer card must stay unrecognised to count as the hole card.
-        clear_frames: Frames without cards that start a new round.
+        clear_frames: Frames without cards that start a new round (see the module docstring).
+        refound_distance: How far, in card sizes, a lost card may reappear and still be taken
+            for the same card.
     """
 
     def __init__(
@@ -95,6 +101,7 @@ class Table:
         dealer_line: float = 0.5,
         hidden_frames: int = 15,
         clear_frames: int = 15,
+        refound_distance: float = 1.5,
     ) -> None:
         if not 0.0 < dealer_line < 1.0:
             raise ValueError(f"dealer_line must be in (0, 1), got {dealer_line}")
@@ -103,12 +110,13 @@ class Table:
         self.dealer_line = dealer_line
         self.hidden_frames = hidden_frames
         self.clear_frames = clear_frames
+        self.refound_distance = refound_distance
         self.round = Round(rules=self.rules, shoe=self.shoe)
         self.rounds_played = 0
         self.last_results: list[str] = []
         self.hole_card_visible = False
         self._zones: dict[int, Zone] = {}
-        self._dealt: list[tuple[str, Zone, int]] = []
+        self._dealt: list[_Dealt] = []
         self._unknown_frames: dict[int, int] = {}
         self._empty_frames = 0
         self._last_advice: Action | None = None
@@ -129,19 +137,37 @@ class Table:
     # Feeding ------------------------------------------------------------------------------------
 
     def update(
-        self, visible: Sequence[SeenCard], new_cards: Sequence[SeenCard], image_height: int
+        self,
+        visible: Sequence[SeenCard],
+        new_cards: Sequence[SeenCard],
+        image_height: int,
+        *,
+        mat_in_view: bool | None = None,
     ) -> TableUpdate:
-        """Feed the cards of one frame (``visible``) and those recognised in it (``new_cards``)."""
+        """Feed the cards of one frame (``visible``) and those recognised in it (``new_cards``).
+
+        ``mat_in_view`` tells an empty table from a camera looking away (see
+        :func:`~blackjack_vision.vision_classic.mat.mat_in_view`). ``None`` means unknown, and then
+        an empty view only starts a new round once the current one is over.
+        """
         update = TableUpdate()
 
         if not visible:
             self._empty_frames += 1
             if self._empty_frames == self.clear_frames and self._round_has_cards():
-                self._new_round(update, "table cleared")
+                if self.round.phase is Phase.FINISHED:
+                    self._new_round(update, "table cleared after the round")
+                elif mat_in_view:
+                    self._new_round(update, "cards collected")
         else:
             self._empty_frames = 0
 
         in_view = {card.track_id for card in visible}
+        positions = {card.track_id: _centre(card) for card in visible if card.corners is not None}
+        for dealt in self._dealt:
+            if dealt.track_id in positions:
+                dealt.centre = positions[dealt.track_id]
+
         for card in new_cards:
             if card.card is None:
                 continue
@@ -149,13 +175,16 @@ class Table:
             self._zones[card.track_id] = zone
             if self.round.phase is Phase.FINISHED:
                 self._new_round(update, "new cards after the round ended")
-            if self._refound(card.card, zone, in_view):
+            lost = self._refound(card, zone, in_view)
+            if lost is not None:
+                lost.track_id = card.track_id  # the dealt card now follows the new track
+                lost.centre = _centre(card)
                 update.events.append(
                     f"{card.card} seen again in the {zone.value} zone, not recounted"
                 )
                 continue
             if self._deal(card.card, zone, update):
-                self._dealt.append((card.card.code, zone, card.track_id))
+                self._dealt.append(_Dealt(card.card.code, zone, card.track_id, _centre(card)))
 
         self._update_hole_card(visible, image_height)
         self._update_advice(update)
@@ -182,12 +211,19 @@ class Table:
         self.reset()
         update.events.append(f"New round ({reason})")
 
-    def _refound(self, card: Card, zone: Zone, in_view: set[int]) -> bool:
-        """An equal card already dealt to this zone whose track has been lost."""
-        return any(
-            code == card.code and dealt_zone is zone and track_id not in in_view
-            for code, dealt_zone, track_id in self._dealt
-        )
+    def _refound(self, card: SeenCard, zone: Zone, in_view: set[int]) -> _Dealt | None:
+        """The dealt card this one is, if an equal card of the zone lost its track nearby."""
+        centre = _centre(card)
+        size = _size(card)
+        best: _Dealt | None = None
+        best_distance = float("inf")
+        for dealt in self._dealt:
+            if dealt.code != card.card.code or dealt.zone is not zone or dealt.track_id in in_view:
+                continue
+            distance = float(np.hypot(*(centre - dealt.centre)))
+            if distance <= self.refound_distance * size and distance < best_distance:
+                best, best_distance = dealt, distance
+        return best
 
     def _deal(self, card: Card, zone: Zone, update: TableUpdate) -> bool:
         before = self.round.phase
@@ -233,3 +269,23 @@ class Table:
         if advice is not None and advice != self._last_advice:
             update.speech.append(advice.spanish)
         self._last_advice = advice
+
+
+@dataclass
+class _Dealt:
+    """A card dealt in this round and where its track was last seen."""
+
+    code: str
+    zone: Zone
+    track_id: int
+    centre: np.ndarray
+
+
+def _centre(card: SeenCard) -> np.ndarray:
+    return np.asarray(card.corners, dtype=float).mean(axis=0)
+
+
+def _size(card: SeenCard) -> float:
+    """Diagonal of the card's bounding box, in pixels."""
+    corners = np.asarray(card.corners, dtype=float)
+    return float(np.hypot(*(corners.max(axis=0) - corners.min(axis=0))))

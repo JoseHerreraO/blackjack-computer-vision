@@ -38,11 +38,16 @@ Keys: `q` quit, space pause, `r` new round, `n` new shoe (count to 0), `l` lock 
   dealer's. Sit so that the dealer's cards are on the far half of the image.
 - **Hole card**: a dealer card that stays unrecognised for 15 frames while the dealer shows one
   card is the face-down card. It is counted once it is turned over.
-- **New round**: the table empty for 15 frames, or a card after the round has ended. The count
-  carries over. A new shoe is the `n` key.
+- **New round**: a card after the round has ended, or 15 frames without cards when that cannot
+  lose a hand, either because the round is over or because the mat is in view and empty (the
+  cards were collected). The mat is found by its colour in HSV (`vision_classic/mat.py`: teal,
+  hue about 87). With the head turned away the mat is not in view, so the round waits for the
+  cards to come back. The count carries over. A new shoe is the `n` key.
 - **Cards found again**: a card hidden for a moment comes back with a new track and is named again.
-  If the same code was already dealt to the same zone in this round and its old track is gone, it
-  is not dealt or counted twice. Two equal cards in view at once are two cards.
+  If the same code was already dealt to the same zone in this round, its old track is gone and it
+  reappears within 1.5 card sizes of where it was last seen, it is not dealt or counted twice, and
+  the dealt card takes over the new track, so a later equal card counts. Two equal cards in view at
+  once are two cards.
 
 ## Known limits
 
