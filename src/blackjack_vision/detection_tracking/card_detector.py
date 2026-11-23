@@ -28,6 +28,15 @@ Pipeline:
    value it estimated (the head pitch changes slowly), or ``foreshortening_default`` before the
    first estimate.
 
+   When every card lies the same way the estimate is ambiguous: an upright card squashed by
+   ``c`` looks exactly like a sideways card squashed by ``(88/63)^2 c``, about ``1.95 c``, so
+   with the glasses (``c`` about 0.5) both 0.5 and about 1.0 explain the frame, and picking 1.0
+   would rectify every card rotated by 90 degrees. The estimate is therefore pulled towards the
+   previous one (or the default) by ``foreshortening_prior_weight * |log(c / previous)|``. The
+   pull is small against real evidence (cards in both orientations), so a real change of head
+   pitch still moves it, but it decides between near-equal explanations. With the glasses use
+   :meth:`CardDetectorConfig.for_glasses`, which starts from 0.5.
+
 Blobs large enough to hold a card that fail the shape checks are returned as *clusters*: usually
 several overlapping cards of one hand, which a later stage can split.
 
@@ -87,8 +96,11 @@ class CardDetectorConfig:
         foreshortening_range: Values tried when ``foreshortening`` is estimated.
         foreshortening_min_cards: Candidates needed to estimate it. With fewer, the last
             estimate is reused, or ``foreshortening_default`` before the first one.
-        foreshortening_default: Value used before anything was estimated (``1`` = none; about
-            ``0.5`` for the glasses looking down at the table).
+        foreshortening_default: Value used before anything was estimated, and the first
+            prior (``1`` = seen from above; about ``0.5`` for the glasses looking down at the
+            table, see :meth:`for_glasses`).
+        foreshortening_prior_weight: How strongly the estimate is pulled towards the previous
+            one (``0`` = every frame on its own).
         candidate_aspect_range: Raw aspect ratios a quadrilateral may have to take part in the
             estimation.
     """
@@ -111,6 +123,7 @@ class CardDetectorConfig:
     foreshortening_range: tuple[float, float] = (0.4, 1.0)
     foreshortening_min_cards: int = 3
     foreshortening_default: float = 1.0
+    foreshortening_prior_weight: float = 0.1
     candidate_aspect_range: tuple[float, float] = (1.0, 3.2)
 
     def __post_init__(self) -> None:
@@ -128,11 +141,18 @@ class CardDetectorConfig:
             raise ValueError(
                 f"foreshortening_default must be in (0, 1], got {self.foreshortening_default}"
             )
+        if self.foreshortening_prior_weight < 0:
+            raise ValueError("foreshortening_prior_weight must be >= 0")
         if self.foreshortening is not None and not 0.0 < self.foreshortening <= 1.0:
             raise ValueError(f"foreshortening must be in (0, 1], got {self.foreshortening}")
         f_low, f_high = self.foreshortening_range
         if not 0.0 < f_low < f_high <= 1.0:
             raise ValueError(f"Invalid foreshortening_range {self.foreshortening_range}")
+
+    @classmethod
+    def for_glasses(cls, **overrides: object) -> CardDetectorConfig:
+        """Settings for the Meta glasses looking down at the table (table squashed to ~0.5)."""
+        return cls(**{"foreshortening_default": 0.5, **overrides})
 
 
 @dataclass(frozen=True, eq=False)
@@ -254,6 +274,8 @@ class CardDetector:
                 config.foreshortening_range,
                 config.foreshortening_min_cards,
                 config.candidate_aspect_range,
+                prior=self._last_foreshortening or config.foreshortening_default,
+                prior_weight=config.foreshortening_prior_weight,
             )
             if estimate is not None:
                 self._last_foreshortening = estimate
@@ -308,12 +330,16 @@ def estimate_foreshortening(
     min_cards: int = 3,
     candidate_aspect_range: tuple[float, float] = (1.0, 3.2),
     steps: int = 61,
+    prior: float | None = None,
+    prior_weight: float = 0.1,
 ) -> float | None:
     """Vertical scale of the table that makes the quadrilaterals look most like cards.
 
     Every candidate is stretched vertically by ``1 / c`` for each ``c`` in ``search_range`` and
     the ``c`` with the smallest median ``|log(aspect / CARD_ASPECT_RATIO)|`` wins. The median keeps
-    a few non-card rectangles from pulling the estimate. Returns ``None`` when fewer than
+    a few non-card rectangles from pulling the estimate. With a ``prior`` (the previous estimate)
+    ``prior_weight * |log(c / prior)|`` is added, which settles the ambiguity of frames where all
+    the cards lie the same way (see the module docstring). Returns ``None`` when fewer than
     ``min_cards`` quadrilaterals have a plausible raw aspect ratio.
     """
     low, high = candidate_aspect_range
@@ -327,6 +353,8 @@ def estimate_foreshortening(
             for quad in usable
         ]
         error = float(np.median(errors))
+        if prior is not None and prior_weight > 0:
+            error += prior_weight * abs(float(np.log(scale / prior)))
         if error < best_error - 1e-9:
             best_scale, best_error = float(scale), error
     return best_scale

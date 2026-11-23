@@ -108,3 +108,77 @@ def test_estimate_needs_enough_cards():
 def test_invalid_foreshortening_config_is_rejected(kwargs):
     with pytest.raises(ValueError):
         CardDetectorConfig(**kwargs)
+
+
+# All cards lying the same way (review of PR #19) ----------------------------------------------
+
+
+def noisy_card(rng, cx, c, angle=0.0, scale=1.6):
+    """Card corners on a 63 x 88 table, rotated, squashed by ``c`` and with 1.5 px of noise."""
+    quad = np.array([[-31.5, -44], [31.5, -44], [31.5, 44], [-31.5, 44]]) * scale
+    a = np.deg2rad(angle)
+    rotation = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    corners = quad @ rotation.T + [cx, 300]
+    corners[:, 1] *= c
+    return (corners + rng.normal(0, 1.5, (4, 2))).astype(np.float32)
+
+
+def share_right(true_c, angles, prior, frames=150, weight=0.1, seed=0):
+    rng = np.random.default_rng(seed)
+    hits = 0
+    for _ in range(frames):
+        quads = [noisy_card(rng, 100 + 150 * i, true_c, a) for i, a in enumerate(angles)]
+        estimate = estimate_foreshortening(quads, prior=prior, prior_weight=weight)
+        hits += abs(np.log(estimate / true_c)) <= 0.12
+    return hits / frames
+
+
+@pytest.mark.parametrize("true_c", [0.45, 0.5])
+def test_upright_cards_alone_are_ambiguous_without_a_prior(true_c):
+    # An upright card squashed by c looks like a sideways one squashed by ~1.95 c.
+    assert share_right(true_c, [0, 0, 0, 0], prior=None) < 0.8
+
+
+@pytest.mark.parametrize("true_c", [0.45, 0.5, 0.55])
+def test_prior_settles_upright_cards_with_the_glasses(true_c):
+    assert share_right(true_c, [0, 0, 0, 0], prior=0.5) >= 0.99
+
+
+def test_prior_settles_upright_cards_seen_from_above():
+    assert share_right(1.0, [0, 0, 0, 0], prior=1.0) >= 0.99
+
+
+@pytest.mark.parametrize(("true_c", "prior"), [(0.8, 0.5), (0.5, 0.9)])
+def test_real_evidence_overrides_the_prior(true_c, prior):
+    # The head pitch changed: with cards in several orientations the data wins.
+    assert share_right(true_c, [0, 90, 30, 60], prior=prior) >= 0.99
+
+
+def test_glasses_detector_keeps_upright_cards_portrait():
+    centres = [(110, 300), (260, 300), (410, 300), (560, 300)]
+    scene = scene_with_cards([placed_corners(c, 170) for c in centres], size=SIZE)
+    image = squashed(scene)
+    detector = CardDetector(CardDetectorConfig.for_glasses())
+    for _ in range(3):
+        result = detector.detect(image)
+        assert len(result.cards) == 4
+        assert result.foreshortening == pytest.approx(SQUASH, abs=0.06)
+        for card in result.cards:
+            edges = side_lengths(card.corners)  # in the image an upright card is wider than tall
+            corrected = side_lengths(
+                (card.corners * [1, 1 / result.foreshortening]).astype(np.float32)
+            )
+            assert corrected[0] < corrected[1], (
+                "rectified card would come out rotated by 90 degrees"
+            )
+            assert edges[0] > 0
+
+
+def test_for_glasses_preset():
+    config = CardDetectorConfig.for_glasses(min_fill=0.9)
+    assert config.foreshortening_default == 0.5 and config.min_fill == 0.9
+
+
+def test_negative_prior_weight_is_rejected():
+    with pytest.raises(ValueError):
+        CardDetectorConfig(foreshortening_prior_weight=-0.1)
