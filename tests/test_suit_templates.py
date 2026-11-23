@@ -9,7 +9,6 @@ from blackjack_vision.vision_classic.suit_templates import (
     TEMPLATE_SIZE,
     SuitTemplates,
     corner_symbols,
-    largest_blob_mask,
     ncc,
     normalise_symbol,
     suit_symbol_mask,
@@ -59,16 +58,6 @@ def test_symbol_is_the_lowest_blob_of_the_index():
     rows = np.nonzero(mask.any(axis=1))[0]
     assert rows.min() > mask.shape[0] * 0.4  # below the "10"
     assert suit_symbol_mask(np.full((96, 44, 3), 245, np.uint8)) is None
-
-
-def test_largest_blob_share():
-    image = np.full((100, 100, 3), 245, np.uint8)
-    assert largest_blob_mask(image) == (None, 0.0)
-    cv2.circle(image, (50, 50), 20, (0, 0, 0), -1)
-    cv2.circle(image, (90, 90), 3, (0, 0, 0), -1)
-    mask, share = largest_blob_mask(image)
-    assert mask[50, 50] == 255 and mask[90, 90] == 0
-    assert 0.9 < share < 1.0
 
 
 def test_templates_classify_every_suit(templates):

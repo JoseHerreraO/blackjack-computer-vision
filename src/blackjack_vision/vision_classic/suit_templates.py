@@ -66,20 +66,6 @@ def suit_symbol_mask(corner: np.ndarray, upscale: int = SYMBOL_UPSCALE) -> np.nd
     return np.where(labels == best, 255, 0).astype(np.uint8)
 
 
-def largest_blob_mask(image: np.ndarray, upscale: int = 1) -> tuple[np.ndarray | None, float]:
-    """Mask of the largest ink blob of ``image`` and the share of the ink it holds.
-
-    Used on the centre of an ace, where the single large pip is almost all the ink.
-    """
-    mask = ink_mask(image, upscale)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
-    if count <= 1:
-        return None, 0.0
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    best = 1 + int(np.argmax(areas))
-    return np.where(labels == best, 255, 0).astype(np.uint8), float(areas.max() / areas.sum())
-
-
 def normalise_symbol(mask: np.ndarray, size: int = TEMPLATE_SIZE) -> np.ndarray:
     """Crop a symbol mask to its bounding box, centre it in a square and resize it.
 

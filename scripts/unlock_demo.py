@@ -5,8 +5,11 @@ The secret is never drawn on screen, only how many aces of it have been shown. I
 for spades, hearts, diamonds, clubs), so it does not end up in the shell history.
 
 The suit templates come from a trained recogniser (``scripts/train_recognizer.py``). With
-``--use-rank`` the recogniser also decides which cards are aces; otherwise the single large pip
-in the middle of the card does.
+``--use-rank`` the recogniser also decides which cards are aces; otherwise a card with exactly
+one pip in its body counts as an ace.
+
+Show one ace at a time and take it away before showing the next one: with two aces in view the
+frame is ignored, so aces left on the table stop the sequence.
 
 Examples::
 

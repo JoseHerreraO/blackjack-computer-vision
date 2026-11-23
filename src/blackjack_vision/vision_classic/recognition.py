@@ -8,8 +8,8 @@
   the face-card artwork tell the 13 ranks apart (what Blackjack and the Hi-Lo count need). The
   detector cannot tell which short side of a card is the top, so every training card is also
   used rotated by 180 degrees.
-* **Suit**: colour, then template matching (Tema 3). The fraction of red ink in the index corners
-  (HSV, Tema 2) decides whether the suit is red or black, and the normalised cross-correlation of
+* **Suit**: colour, then template matching (Tema 3). The fraction of red ink on the card (HSV,
+  Tema 2) decides whether the suit is red or black, and the normalised cross-correlation of
   the suit symbol under the rank with one template per suit
   (:mod:`blackjack_vision.vision_classic.suit_templates`) picks one of the two suits of that
   colour. In a bag of words the small symbol is diluted among the pips, which confuses spades
@@ -42,12 +42,19 @@ from blackjack_vision.vision_classic.features import (
     SiftExtractor,
     Vocabulary,
 )
-from blackjack_vision.vision_classic.suit_templates import SuitTemplates, corner_symbols
+from blackjack_vision.vision_classic.suit_templates import SuitTemplates, corner_symbols, ink_mask
 
 logger = logging.getLogger(__name__)
 
 MODEL_FORMAT_VERSION = 2
-RED_INK_THRESHOLD = 0.25
+RED_INK_THRESHOLD = 0.45
+"""Share of red ink above which a card is red. Real red ink from the glasses is orange-ish and
+pale; on the 18/11 recording red cards measured 0.59-0.80 and black ones 0.00-0.30."""
+RED_HUE_MAX = 20
+RED_HUE_MIN = 165
+RED_MIN_SATURATION = 45
+CARD_MARGIN = 0.04
+"""Border of the rectified card left out of colour measurements (table pixels may leak in)."""
 INDEX_REGION = (0.22, 0.32)
 """Width and height of each index corner, as fractions of the card."""
 
@@ -121,7 +128,7 @@ class Prediction:
         suit: Most likely suit, ``None`` if no suit symbol could be read.
         rank_margin: Score gap between the best and the second-best rank (higher = surer).
         suit_margin: Score gap between the best and the second-best allowed suit.
-        red_ink: Fraction of red ink in the index corners.
+        red_ink: Fraction of the ink of the card that is red.
     """
 
     rank: Rank
@@ -273,7 +280,7 @@ class CardRecognizer:
         for image, scores in zip(images, rank_scores, strict=True):
             rank_index, rank_margin = _best(scores)
             corners = index_corners(image, self.config.index_region)
-            red_ink = red_ink_fraction(image, self.config.index_region)
+            red_ink = red_ink_fraction(image)
             allowed = None
             if self.config.colour_filter and both_colours:
                 red = red_ink >= RED_INK_THRESHOLD
@@ -334,19 +341,24 @@ def index_corners(card: np.ndarray, region: tuple[float, float] = INDEX_REGION) 
     return [top_left, bottom_right]
 
 
-def red_ink_fraction(card: np.ndarray, region: tuple[float, float] = INDEX_REGION) -> float:
-    """Fraction of the ink in the two index corners of a rectified card that is red.
+def red_ink_fraction(card: np.ndarray, margin: float = CARD_MARGIN) -> float:
+    """Fraction of the ink of a rectified card that is red (HSV, Tema 2).
 
-    Only the index corners are used (they hold the rank and suit symbol in every deck), because
-    the artwork of face cards mixes colours. Paper pixels (bright and unsaturated) are not ink.
+    Ink pixels are found with Otsu's threshold on the minimum of the B, G and R channels (dark for
+    ink of any colour). A pixel is red when its hue is within ``RED_HUE_MAX`` of red and its
+    saturation is at least ``RED_MIN_SATURATION``. The whole card body is used, not only the index
+    corners: in the glasses video the indices are small and pale, and real red ink is more orange
+    and less saturated than a pure red.
     """
     if card.ndim != 3:
         return 0.0
-    pixels = np.concatenate([corner.reshape(-1, 3) for corner in index_corners(card, region)])
-    hsv = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    hue, saturation, value = (hsv[:, i].astype(int) for i in range(3))
-    ink = (value < 160) | (saturation > 80)
-    red = ((hue <= 10) | (hue >= 170)) & (saturation >= 90) & (value >= 50)
+    height, width = card.shape[:2]
+    dy, dx = int(margin * height), int(margin * width)
+    body = card[dy : height - dy, dx : width - dx]
+    ink = ink_mask(body, upscale=1) > 0
+    hsv = cv2.cvtColor(body, cv2.COLOR_BGR2HSV)
+    hue, saturation = hsv[..., 0].astype(int), hsv[..., 1].astype(int)
+    red = ((hue <= RED_HUE_MAX) | (hue >= RED_HUE_MIN)) & (saturation >= RED_MIN_SATURATION)
     count = int(ink.sum())
     return float((red & ink).sum() / count) if count else 0.0
 

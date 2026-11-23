@@ -6,8 +6,8 @@ Everything uses techniques of the course:
 | Step | Technique | Tema |
 |------|-----------|------|
 | Find and rectify the card | `CardDetector` + homography to 200 × 300 | 3, 4 |
-| Red or black | Fraction of red ink (HSV) in the index corners | 2 |
-| Is it an ace? | Otsu thresholding of the centre of the card and connected components: the largest blob must hold ≥ 60 % of the ink and not touch the region border (one big pip). The recogniser's rank can be used instead (`--use-rank`). | 3, 5 |
+| Red or black | Share of the card's ink (Otsu) that is red in HSV: hue ≤ 20 or ≥ 165 and saturation ≥ 45, threshold 0.45 over the whole card body | 2 |
+| Is it an ace? | Otsu thresholding of the card body (without the margin and the four index corners) and connected components: the sizeable blobs are the pips, and an ace has exactly one, not too small and not as large as a face-card picture. The recogniser's rank is preferred when available (`--use-rank`). | 3, 5 |
 | Which suit? | The pip and the index symbols are cropped, centred and resized to 32 × 32, then compared with one template per suit by normalised cross-correlation (`cv2.matchTemplate`, `TM_CCOEFF_NORMED`). The pip is also tried upside down. Only suits of the detected colour compete. | 3 |
 | Sequence | `SequenceDecoder` (see below) | – |
 
@@ -24,6 +24,8 @@ cards; the same templates give the suit in the recogniser (`vision_classic/suit_
   the start of the secret); more than `timeout` seconds between aces starts over; `r` restarts
   and locks again.
 * The screen only shows the progress (`LOCKED ##..`), never the secret.
+* **Take each ace away before showing the next one.** With two aces in view the frame is
+  ignored, so aces left on the table stop the sequence.
 
 ## Running it
 
@@ -38,3 +40,16 @@ shell history.
 
 On the synthetic cards of the tests, the pip test separates the 40 aces from the other 480 cards
 without errors and reads all their suits, also upside down.
+
+## Lessons from real glasses footage
+
+The first version, tested on 171 rectified crops of the 18/11 recording (720×1280), had two
+problems that the synthetic cards did not show; both are now regression tests:
+
+* It looked only at the centre of the card for "one big pip". In our deck the 3 and the 5 have a
+  single pip there too, so 85 of 157 non-aces were taken as aces. Counting the pips over the whole
+  body fixes it.
+* It measured red ink in the index corners with hue ≤ 10 and saturation ≥ 90. In the video the
+  indices are small and pale and the real red ink is orange-ish (median hue 9, saturation 79), so
+  every red card read as black (0.000). Measured over the whole card with the thresholds above,
+  red cards give 0.59–0.80 and black ones 0.00–0.30.

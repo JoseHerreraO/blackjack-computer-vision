@@ -165,3 +165,53 @@ def test_two_aces_in_view_are_ignored(reader):
         event, readings = system.update([spade, heart], i * 0.1)
         assert event is DecoderEvent.NONE and len(readings) == 2
     assert system.decoder.progress == 0
+
+
+# --------------------------------------------------------------------------- real-deck regressions
+
+
+def _real_layout(rank: Rank, suit: Suit) -> np.ndarray:
+    """A card laid out like our real deck: the 3 and the 5 have one pip alone in the centre and
+    their other pips near the top and bottom edges, outside the old centre region."""
+    from synthetic_faces import PAPER, draw_suit
+
+    card = card_face(Card(rank, suit))
+    card[100:200, 50:150] = PAPER
+    card[30:100, 50:150] = PAPER
+    card[200:270, 50:150] = PAPER
+    height, width = card.shape[:2]
+    layouts = {
+        Rank.THREE: [(0.5, 0.17), (0.5, 0.5), (0.5, 0.83)],
+        Rank.FIVE: [(0.32, 0.17), (0.68, 0.17), (0.5, 0.5), (0.32, 0.83), (0.68, 0.83)],
+    }
+    for fx, fy in layouts[rank]:
+        draw_suit(card, suit, (fx * width, fy * height), 46)  # pips as big as in our deck
+    return card
+
+
+@pytest.mark.parametrize("rank", [Rank.THREE, Rank.FIVE])
+def test_a_single_central_pip_is_not_enough_to_be_an_ace(reader, rank):
+    for suit in (Suit.CLUBS, Suit.DIAMONDS):
+        card = _real_layout(rank, suit)
+        assert not reader.read(card).is_ace
+        assert len(reader.body_pips(card)) == int(rank.value)
+
+
+def test_pale_orange_red_ink_reads_as_red(reader):
+    import cv2
+
+    from blackjack_vision.vision_classic.recognition import RED_INK_THRESHOLD, red_ink_fraction
+
+    # Red ink measured on the glasses video: orange-ish and pale (median hue 9, saturation 79
+    # in OpenCV HSV), with a light background behind it.
+    card = card_face(Card(Rank.ACE, Suit.HEARTS))
+    hsv = cv2.cvtColor(card, cv2.COLOR_BGR2HSV)
+    inked = hsv[..., 1] > 40
+    hsv[inked, 0] = 9
+    hsv[inked, 1] = np.minimum(hsv[inked, 1], 79)
+    hsv[inked, 2] = np.maximum(hsv[inked, 2], 190)
+    card = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    assert red_ink_fraction(card) >= RED_INK_THRESHOLD
+    reading = reader.read(card)
+    assert reading.is_ace and reading.suit is Suit.HEARTS
+    assert red_ink_fraction(card_face(Card(Rank.ACE, Suit.SPADES))) < RED_INK_THRESHOLD

@@ -2,9 +2,11 @@
 
 Two parts, built only with techniques of the course:
 
-* :class:`AceReader` looks at a rectified card. An ace has a single large pip in the middle, so
-  after thresholding the centre of the card (Otsu, Tema 3), the largest connected component
-  (Tema 5) holds almost all the ink. Its suit comes from template matching with normalised
+* :class:`AceReader` looks at a rectified card. The ink of the card body (everything but the
+  margin and the four index corners) is thresholded with Otsu (Tema 3) and split into connected
+  components (Tema 5); the sizeable ones are the pips. An ace has exactly one, a 3 has three, a
+  face card has a large picture. Counting over the whole body matters: in a real deck the centre
+  of a 3 or a 5 holds a single pip too. Its suit comes from template matching with normalised
   cross-correlation (Tema 3) of that pip and of the symbols of the index corners against the suit
   templates, restricted to the colour of the ink (HSV, Tema 2). The pip may be upside down, so
   both orientations of each template are tried for it. When the recogniser already knows the
@@ -24,6 +26,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+import cv2
 import numpy as np
 
 from blackjack_vision.blackjack.cards import Rank, Suit
@@ -36,16 +39,20 @@ from blackjack_vision.vision_classic.recognition import (
 from blackjack_vision.vision_classic.suit_templates import (
     SuitTemplates,
     corner_symbols,
-    largest_blob_mask,
+    ink_mask,
     normalise_symbol,
 )
 
-CENTRE_REGION = (0.15, 0.25, 0.85, 0.75)
-"""``(x0, y0, x1, y1)`` of the centre of a rectified card where an ace has its pip."""
-MIN_PIP_SHARE = 0.6
-"""Share of the ink of the centre that the largest blob must hold for the card to be an ace."""
-MIN_PIP_AREA = 0.03
-"""Smallest pip, as a fraction of the centre region."""
+BODY_MARGIN = 0.05
+"""Border of the rectified card left out of the pip count (table pixels, card edge)."""
+MIN_PIP_AREA = 0.004
+"""Smallest blob that can be a pip, as a fraction of the card area."""
+PIP_RELATIVE_AREA = 0.2
+"""A blob counts as a pip when it is at least this fraction of the largest blob."""
+MIN_ACE_PIP_AREA = 0.01
+"""Smallest ace pip, as a fraction of the card area (an ace pip is larger than a 2's)."""
+MAX_ACE_PIP_SIZE = 0.7
+"""Largest ace pip, as a fraction of the body width and height (a face-card frame is larger)."""
 
 
 @dataclass(frozen=True)
@@ -56,7 +63,7 @@ class AceReading:
         is_ace: The card is an ace.
         suit: Its suit, ``None`` when it is not an ace or the suit could not be read.
         margin: NCC score gap between the best suit and the runner-up (higher = surer).
-        red_ink: Fraction of red ink in the index corners.
+        red_ink: Fraction of the ink of the card that is red.
     """
 
     is_ace: bool
@@ -81,33 +88,65 @@ class AceReader:
         self.templates = templates
         self.index_region = index_region
 
-    def central_pip(self, card: np.ndarray) -> np.ndarray | None:
-        """Mask of the single large pip in the centre of the card, or ``None`` if there is none."""
+    def body_pips(self, card: np.ndarray) -> list[np.ndarray]:
+        """Masks (full card size) of the pips of the card body, largest first.
+
+        The body is the card without a ``BODY_MARGIN`` border and without the four index corners
+        (some decks print the index in all four). Its ink is thresholded with Otsu and split into
+        connected components; a component is a pip when its area is at least ``MIN_PIP_AREA`` of
+        the card and ``PIP_RELATIVE_AREA`` of the largest one (so specks and decorations do not
+        count).
+        """
         height, width = card.shape[:2]
-        x0, y0, x1, y1 = CENTRE_REGION
-        centre = card[int(y0 * height) : int(y1 * height), int(x0 * width) : int(x1 * width)]
-        mask, share = largest_blob_mask(centre)
-        if mask is None or share < MIN_PIP_SHARE:
+        mask = ink_mask(card, upscale=1)
+        dy, dx = int(BODY_MARGIN * height), int(BODY_MARGIN * width)
+        body = np.zeros_like(mask)
+        body[dy : height - dy, dx : width - dx] = 255
+        corner_w, corner_h = int(self.index_region[0] * width), int(self.index_region[1] * height)
+        for y in (0, height - corner_h):
+            for x in (0, width - corner_w):
+                body[y : y + corner_h, x : x + corner_w] = 0
+        mask = cv2.bitwise_and(mask, body)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+        if count <= 1:
+            return []
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        threshold = max(MIN_PIP_AREA * height * width, PIP_RELATIVE_AREA * areas.max())
+        order = np.argsort(areas)[::-1]
+        return [
+            np.where(labels == 1 + int(i), 255, 0).astype(np.uint8)
+            for i in order
+            if areas[i] >= threshold
+        ]
+
+    def ace_pip(self, card: np.ndarray) -> np.ndarray | None:
+        """Mask of the pip if the card is an ace (exactly one pip in the body), else ``None``."""
+        pips = self.body_pips(card)
+        if len(pips) != 1:
             return None
-        if np.count_nonzero(mask) < MIN_PIP_AREA * mask.size:
+        pip = pips[0]
+        height, width = card.shape[:2]
+        if np.count_nonzero(pip) < MIN_ACE_PIP_AREA * height * width:
             return None
-        rows, cols = np.nonzero(mask)
-        if rows.min() == 0 or cols.min() == 0:  # cut by the region: artwork, not a pip
-            return None
-        if rows.max() == mask.shape[0] - 1 or cols.max() == mask.shape[1] - 1:
-            return None
-        return mask
+        rows, cols = np.nonzero(pip)
+        body_h, body_w = (1 - 2 * BODY_MARGIN) * height, (1 - 2 * BODY_MARGIN) * width
+        if (
+            np.ptp(rows) + 1 > MAX_ACE_PIP_SIZE * body_h
+            or np.ptp(cols) + 1 > MAX_ACE_PIP_SIZE * body_w
+        ):
+            return None  # a face-card picture or frame, not a pip
+        return pip
 
     def read(self, card: np.ndarray, rank: Rank | None = None) -> AceReading:
         """Read one rectified card (BGR).
 
         Args:
             card: Rectified card, e.g. the output of ``rectify_card``.
-            rank: Rank given by the recogniser, if known. Without it the card counts as an ace
-                when its centre holds a single large pip.
+            rank: Rank given by the recogniser, if known (preferred). Without it the card counts
+                as an ace when its body holds exactly one pip.
         """
-        red_ink = red_ink_fraction(card, self.index_region)
-        pip = self.central_pip(card)
+        red_ink = red_ink_fraction(card)
+        pip = self.ace_pip(card)
         is_ace = rank is Rank.ACE if rank is not None else pip is not None
         if not is_ace:
             return AceReading(False, red_ink=red_ink)
