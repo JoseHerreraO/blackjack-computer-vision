@@ -15,8 +15,27 @@ Pipeline:
 4. **Quadrilateral fit**: ``approxPolyDP`` on the convex hull must give exactly 4 vertices; the
    vertices are ordered and refined to the sharp corners
    (:mod:`blackjack_vision.vision_classic.corners`).
-5. **Shape checks**: aspect ratio around that of a playing card (63 x 88 mm, about 1.4, wider
-   range to tolerate perspective) and a blob area close to the area of the fitted quadrilateral.
+5. **Shape checks**: a blob area close to the area of the fitted quadrilateral, and an aspect
+   ratio around that of a playing card (63 x 88 mm, about 1.4).
+6. **Foreshortening** (:func:`estimate_foreshortening`). A camera that looks at the table at an
+   angle, like the glasses on the player's head, squashes the table vertically: a card lying
+   upright looks almost square and one lying sideways looks twice as long as it is wide, so the
+   raw aspect ratio of real cards falls anywhere between about 1.0 and 2.5. With at least
+   ``foreshortening_min_cards`` candidates in the frame, the vertical scale ``c`` that makes
+   their aspect ratios closest to a card's is estimated, and the aspect check (and the corner
+   order) is done on the quadrilaterals stretched by ``1 / c``. A square stays square after the
+   correction, so it is still rejected. With fewer candidates the detector reuses the last
+   value it estimated (the head pitch changes slowly), or ``foreshortening_default`` before the
+   first estimate.
+
+   When every card lies the same way the estimate is ambiguous: an upright card squashed by
+   ``c`` looks exactly like a sideways card squashed by ``(88/63)^2 c``, about ``1.95 c``, so
+   with the glasses (``c`` about 0.5) both 0.5 and about 1.0 explain the frame, and picking 1.0
+   would rectify every card rotated by 90 degrees. The estimate is therefore pulled towards the
+   previous one (or the default) by ``foreshortening_prior_weight * |log(c / previous)|``. The
+   pull is small against real evidence (cards in both orientations), so a real change of head
+   pitch still moves it, but it decides between near-equal explanations. With the glasses use
+   :meth:`CardDetectorConfig.for_glasses`, which starts from 0.5.
 
 Blobs large enough to hold a card that fail the shape checks are returned as *clusters*: usually
 several overlapping cards of one hand, which a later stage can split.
@@ -72,6 +91,18 @@ class CardDetectorConfig:
         refine: Refine the vertices to the sharp corners by line fitting.
         border_margin: Blobs whose bounding box comes closer than this to the image border are
             ignored (``-1`` keeps them).
+        foreshortening: Vertical scale of the table in the image (``1`` = seen from above).
+            ``None`` estimates it in every frame from the candidate cards.
+        foreshortening_range: Values tried when ``foreshortening`` is estimated.
+        foreshortening_min_cards: Candidates needed to estimate it. With fewer, the last
+            estimate is reused, or ``foreshortening_default`` before the first one.
+        foreshortening_default: Value used before anything was estimated, and the first
+            prior (``1`` = seen from above; about ``0.5`` for the glasses looking down at the
+            table, see :meth:`for_glasses`).
+        foreshortening_prior_weight: How strongly the estimate is pulled towards the previous
+            one (``0`` = every frame on its own).
+        candidate_aspect_range: Raw aspect ratios a quadrilateral may have to take part in the
+            estimation.
     """
 
     segmentation: Segmentation = Segmentation.WHITENESS
@@ -88,6 +119,12 @@ class CardDetectorConfig:
     approx_epsilons: tuple[float, ...] = (0.01, 0.015, 0.02, 0.025)
     refine: bool = True
     border_margin: int = 2
+    foreshortening: float | None = None
+    foreshortening_range: tuple[float, float] = (0.4, 1.0)
+    foreshortening_min_cards: int = 3
+    foreshortening_default: float = 1.0
+    foreshortening_prior_weight: float = 0.1
+    candidate_aspect_range: tuple[float, float] = (1.0, 3.2)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segmentation", Segmentation(self.segmentation))
@@ -100,6 +137,22 @@ class CardDetectorConfig:
             raise ValueError(f"Invalid aspect_range {self.aspect_range}")
         if not 0.0 < self.min_fill <= 1.0:
             raise ValueError(f"min_fill must be in (0, 1], got {self.min_fill}")
+        if not 0.0 < self.foreshortening_default <= 1.0:
+            raise ValueError(
+                f"foreshortening_default must be in (0, 1], got {self.foreshortening_default}"
+            )
+        if self.foreshortening_prior_weight < 0:
+            raise ValueError("foreshortening_prior_weight must be >= 0")
+        if self.foreshortening is not None and not 0.0 < self.foreshortening <= 1.0:
+            raise ValueError(f"foreshortening must be in (0, 1], got {self.foreshortening}")
+        f_low, f_high = self.foreshortening_range
+        if not 0.0 < f_low < f_high <= 1.0:
+            raise ValueError(f"Invalid foreshortening_range {self.foreshortening_range}")
+
+    @classmethod
+    def for_glasses(cls, **overrides: object) -> CardDetectorConfig:
+        """Settings for the Meta glasses looking down at the table (table squashed to ~0.5)."""
+        return cls(**{"foreshortening_default": 0.5, **overrides})
 
 
 @dataclass(frozen=True, eq=False)
@@ -137,11 +190,13 @@ class DetectionResult:
         clusters: Contours of blobs big enough to hold a card that are not one card (usually
             overlapping cards).
         mask: Binary card mask after morphology (``uint8``, 0 or 255).
+        foreshortening: Vertical scale of the table used for the shape checks (``1`` = none).
     """
 
     cards: list[CardDetection] = field(default_factory=list)
     clusters: list[np.ndarray] = field(default_factory=list)
     mask: np.ndarray | None = None
+    foreshortening: float = 1.0
 
 
 class CardDetector:
@@ -153,6 +208,7 @@ class CardDetector:
 
     def __init__(self, config: CardDetectorConfig | None = None) -> None:
         self.config = config or CardDetectorConfig()
+        self._last_foreshortening: float | None = None
         self._open_kernel = _ellipse(self.config.open_ksize)
         self._close_kernel = _ellipse(self.config.close_ksize)
 
@@ -198,22 +254,52 @@ class CardDetector:
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         result = DetectionResult(mask=mask)
+        candidates: list[tuple[np.ndarray, np.ndarray, float]] = []
         for contour in contours:
             area = float(cv2.contourArea(contour))
             if not min_area <= area <= max_area:
                 continue
             if config.border_margin >= 0 and _touches_border(contour, width, height, config):
                 continue
-            corners = self._fit_card(contour, area)
+            corners = self._fit_quad(contour, area)
             if corners is None:
                 result.clusters.append(contour)
             else:
-                result.cards.append(CardDetection(corners, contour, area))
+                candidates.append((corners, contour, area))
+
+        scale = config.foreshortening
+        if scale is None:
+            estimate = estimate_foreshortening(
+                [corners for corners, _, _ in candidates],
+                config.foreshortening_range,
+                config.foreshortening_min_cards,
+                config.candidate_aspect_range,
+                prior=self._last_foreshortening or config.foreshortening_default,
+                prior_weight=config.foreshortening_prior_weight,
+            )
+            if estimate is not None:
+                self._last_foreshortening = estimate
+            scale = self._last_foreshortening or config.foreshortening_default
+        result.foreshortening = scale
+
+        low, high = config.aspect_range
+        for corners, contour, area in candidates:
+            corrected = _stretch(corners, 1.0 / scale)
+            if not low <= aspect_ratio(corrected) <= high:
+                result.clusters.append(contour)
+                continue
+            # Order the corners on the corrected shape so that 0 -> 1 is a real short side.
+            ordered = _stretch(order_corners(corrected), scale).astype(np.float32)
+            result.cards.append(CardDetection(ordered, contour, area))
         result.cards.sort(key=lambda card: (card.center[0], card.center[1]))
         return result
 
-    def _fit_card(self, contour: np.ndarray, area: float) -> np.ndarray | None:
-        """Ordered corners if the blob is a single card, otherwise ``None``."""
+    def reset(self) -> None:
+        """Forget the last foreshortening estimate (for example when switching sources)."""
+        self._last_foreshortening = None
+
+    def _fit_quad(self, contour: np.ndarray, area: float) -> np.ndarray | None:
+        """Refined corners if the blob is a well-filled quadrilateral, otherwise ``None``."""
         config = self.config
         hull = cv2.convexHull(contour)
         perimeter = cv2.arcLength(hull, True)
@@ -231,14 +317,54 @@ class CardDetector:
         quad_area = float(cv2.contourArea(corners.reshape(-1, 1, 2)))
         if quad_area <= 0 or min(area, quad_area) / max(area, quad_area) < config.min_fill:
             return None
-        low, high = config.aspect_range
-        if not low <= aspect_ratio(corners) <= high:
-            return None
         return corners
 
     def _blur(self, image: np.ndarray) -> np.ndarray:
         size = self.config.blur_ksize
         return cv2.GaussianBlur(image, (size, size), 0) if size else image
+
+
+def estimate_foreshortening(
+    quads: list[np.ndarray],
+    search_range: tuple[float, float] = (0.4, 1.0),
+    min_cards: int = 3,
+    candidate_aspect_range: tuple[float, float] = (1.0, 3.2),
+    steps: int = 61,
+    prior: float | None = None,
+    prior_weight: float = 0.1,
+) -> float | None:
+    """Vertical scale of the table that makes the quadrilaterals look most like cards.
+
+    Every candidate is stretched vertically by ``1 / c`` for each ``c`` in ``search_range`` and
+    the ``c`` with the smallest median ``|log(aspect / CARD_ASPECT_RATIO)|`` wins. The median keeps
+    a few non-card rectangles from pulling the estimate. With a ``prior`` (the previous estimate)
+    ``prior_weight * |log(c / prior)|`` is added, which settles the ambiguity of frames where all
+    the cards lie the same way (see the module docstring). Returns ``None`` when fewer than
+    ``min_cards`` quadrilaterals have a plausible raw aspect ratio.
+    """
+    low, high = candidate_aspect_range
+    usable = [quad for quad in quads if low <= aspect_ratio(quad) <= high]
+    if len(usable) < min_cards:
+        return None
+    best_scale, best_error = 1.0, float("inf")
+    for scale in np.linspace(search_range[1], search_range[0], steps):
+        errors = [
+            abs(np.log(aspect_ratio(_stretch(quad, 1.0 / scale)) / CARD_ASPECT_RATIO))
+            for quad in usable
+        ]
+        error = float(np.median(errors))
+        if prior is not None and prior_weight > 0:
+            error += prior_weight * abs(float(np.log(scale / prior)))
+        if error < best_error - 1e-9:
+            best_scale, best_error = float(scale), error
+    return best_scale
+
+
+def _stretch(corners: np.ndarray, factor: float) -> np.ndarray:
+    """Scale the y coordinate of a quadrilateral by ``factor``."""
+    stretched = np.asarray(corners, dtype=np.float64).reshape(-1, 2).copy()
+    stretched[:, 1] *= factor
+    return stretched
 
 
 def draw_detections(
