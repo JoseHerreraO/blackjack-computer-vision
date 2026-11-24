@@ -96,6 +96,8 @@ python scripts/preview_detection.py --source <video|folder|camera>              
 python scripts/capture_cards.py --source 0 --deck                               # build the card dataset
 python scripts/train_recognizer.py --data data/cards                             # see docs/recognition.md
 python scripts/run.py           # real-time assistant
+python scripts/run.py --web     # ... with the dashboard on http://localhost:8000
+python scripts/dashboard_demo.py  # the dashboard with simulated rounds
 ```
 
 Before opening a pull request, run the same checks as the CI.

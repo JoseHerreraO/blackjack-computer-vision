@@ -49,6 +49,31 @@ Keys: `q` quit, space pause, `r` new round, `n` new shoe (count to 0), `l` lock 
   the dealt card takes over the new track, so a later equal card counts. Two equal cards in view at
   once are two cards.
 
+## Web dashboard (`--web`)
+
+`--web` serves a page on http://localhost:8000 (`ui/dashboard.py`, Python standard library only)
+with what the assistant knows, laid out for the demo and the video:
+
+- the glasses video with the detections and the FPS (MJPEG, only encoded while the page is open);
+- the dealer's and the player's cards drawn as cards, with totals and the hole card face down;
+- the advice in large letters (or the result of the round);
+- the Hi-Lo count: running and true count, suggested bet, player edge and shoe penetration;
+- what is left in the shoe by value against the average (red: good for the player);
+- the log of what the glasses said and of the table events;
+- buttons for new round, new shoe, pause and lock (the same as the keys);
+- while locked, a lock screen with how many aces of the secret have been shown, never which.
+
+```powershell
+python scripts/run.py --source bridge --model data/models/recognizer.joblib --web --no-window
+python scripts/run.py --source bridge --web 8080      # another port; the OpenCV window stays
+python scripts/dashboard_demo.py                      # simulated rounds, no glasses or models
+```
+
+The server listens on `127.0.0.1` only. `--web-host 0.0.0.0` opens it to the local network (for
+example to watch it from a phone); the page cannot stop the assistant or read the secret.
+`scripts/dashboard_demo.py` deals rounds from a shuffled shoe on a drawn table through the real
+`Table`, so the page can be tried and recorded without the glasses.
+
 ## Known limits
 
 - **Touching or overlapping cards** are one blob for the classical detector, which reports them as

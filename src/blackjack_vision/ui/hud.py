@@ -53,6 +53,7 @@ def draw_hud(
     table: Table | None = None,
     lock_text: str | None = None,
     locked: bool = False,
+    panel: bool = True,
 ) -> np.ndarray:
     """Return a copy of ``image`` with the HUD.
 
@@ -63,6 +64,8 @@ def draw_hud(
         table: The table state. ``None`` while locked (no hands, no advice).
         lock_text: Lock status line, e.g. ``"LOCKED  ##.."`` or ``"UNLOCKED"``.
         locked: Draw the lock status in red and hide everything else.
+        panel: Draw the bottom panel (hands, advice, count). The web dashboard shows them
+            itself, so its video goes without it.
     """
     view = image.copy()
     height, width = view.shape[:2]
@@ -102,7 +105,7 @@ def draw_hud(
         colour = LOCKED_BGR if locked else (0, 220, 0)
         _text(view, lock_text, (int(10 * s), int(70 * s)), 0.8 * s, colour, thick)
 
-    if table is not None and not locked:
+    if table is not None and not locked and panel:
         _draw_panel(view, table, s, thick)
     return view
 
