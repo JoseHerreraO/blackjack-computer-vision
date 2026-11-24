@@ -79,3 +79,51 @@ show that the pipeline works: the accuracy that counts is the one measured on ou
 
 In the live assistant a card does not need to be recognised in every frame: predictions of the
 same tracked card are combined with `TemporalVoter` (majority over the last N frames).
+
+## 4. Recogniser study for the report
+
+`scripts/study_recognition.py` runs the experiments of the Results section on one train folder
+and one test folder (two separate recordings; without `--test-data` it uses a random split and
+the output warns that the numbers are optimistic):
+
+| Study | What changes | Syllabus |
+|---|---|---|
+| `vocabulary` | number of visual words `K` (default 50, 100, 200, 300) | Tema 4, bag of words |
+| `pyramid` | `1x1`, `1x1+2x2`, `1x1+2x2+4x4` | Tema 4, spatial pyramid |
+| `kernel` | SVM on the same histograms: χ², histogram intersection, linear, RBF | Tema 4 |
+| `baseline` | whole-card template matching with NCC (`TM_CCOEFF_NORMED`), one mean template per card, both 180° orientations | Tema 3 |
+
+```powershell
+python scripts/study_recognition.py --data data/cards --test-data data/cards_test --vocabulary 50 100 200 300 500
+```
+
+It writes `outputs/study/results.csv`, `results.md` (the table for the report) and
+`vocabulary.png` (accuracy and ms/card against `K`). The kernel rows only measure the rank
+(the suit does not depend on the SVM) and their ms/card is the SVM alone: the histograms are
+computed once for all kernels. `--quick` runs tiny settings as a smoke test; `--studies` picks
+a subset.
+
+Synthetic cards, 4 photos per card for training and 2 from another seed for testing
+(52 cards, 2 min 44 s for everything):
+
+| Study | Setting | Rank | Suit | Card | Train (s) | ms/card |
+|---|---|---|---|---|---|---|
+| baseline | template NCC | 95.2 % | 64.4 % | 60.6 % | 0.0 | 19.5 |
+| vocabulary | K=50 | 88.5 % | 100.0 % | 88.5 % | 9.6 | 29.1 |
+| vocabulary | K=100 | 89.4 % | 100.0 % | 89.4 % | 10.5 | 29.9 |
+| vocabulary | K=200 | 93.3 % | 100.0 % | 93.3 % | 11.8 | 32.1 |
+| vocabulary | K=300 | 99.0 % | 100.0 % | 99.0 % | 14.2 | 35.2 |
+| vocabulary | K=500 | 100.0 % | 100.0 % | 100.0 % | 17.5 | 40.8 |
+| pyramid | 1x1 | 98.1 % | 100.0 % | 98.1 % | 11.1 | 29.0 |
+| pyramid | 1x1+2x2 | 98.1 % | 100.0 % | 98.1 % | 11.3 | 30.0 |
+| pyramid | 1x1+2x2+4x4 | 99.0 % | 100.0 % | 99.0 % | 13.6 | 34.2 |
+| kernel | chi2 | 99.0 % | – | – | 3.2 | 4.0 |
+| kernel | intersection | 100.0 % | – | – | 3.2 | 8.1 |
+| kernel | linear | 92.3 % | – | – | 0.2 | 0.6 |
+| kernel | rbf | 99.0 % | – | – | 0.2 | 0.9 |
+
+What it already shows: whole-card NCC gets the rank of these clean synthetic faces but confuses
+suits of the same colour (a spade and a club differ in a few pixels of a 100×150 image), while
+the bag of words with the suit templates never does; accuracy grows with `K` up to about 300
+words at a moderate cost in time; and the kernels designed for histograms (χ², intersection)
+beat the linear one. The numbers for the report must come from the real recordings.
