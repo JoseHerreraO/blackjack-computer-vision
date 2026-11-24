@@ -17,6 +17,7 @@ struct ContentView: View {
                 glassesSection
                 pcSection
                 streamSection
+                voiceSection
                 statusSection
                 logSection
             }
@@ -92,11 +93,20 @@ struct ContentView: View {
         .disabled(model.glasses.hasStream)
     }
 
+    private var voiceSection: some View {
+        Section("Voice") {
+            LabeledContent("Output", value: model.speaker.outputRoute)
+            LabeledContent("Speaking", value: model.speaker.isSpeaking ? "yes" : "no")
+            Button("Test voice") { model.speaker.test() }
+        }
+    }
+
     private var statusSection: some View {
         Section("Status") {
             LabeledContent("PC", value: model.connectionState.rawValue)
             LabeledContent("Frames sent", value: "\(model.framesSent)")
             LabeledContent("Send rate", value: String(format: "%.1f fps", model.sendFps))
+            LabeledContent("PC status", value: model.statusText ?? "–")
             LabeledContent("Last command", value: model.lastCommand ?? "–")
             LabeledContent("App version", value: model.appVersion)
         }

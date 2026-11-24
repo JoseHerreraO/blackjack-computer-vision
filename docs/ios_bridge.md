@@ -3,7 +3,7 @@
 The glasses' camera reaches the PC through a small iPhone app, **BJ Bridge** (`mobile/ios/`).
 The app receives the video from the Ray-Ban Meta glasses with Meta's Wearables Device Access
 Toolkit (DAT) and sends every frame to the PC over TCP. The PC can answer with commands that the
-app shows (and, from step 4, speaks through the glasses).
+app speaks through the glasses (`say`) or shows on screen (`status`).
 
 ```
 Ray-Ban Meta --Bluetooth--> iPhone (BJ Bridge, DAT SDK) --TCP 5050, Wi-Fi--> PC (BridgeSource / pc_receiver.py)
@@ -106,6 +106,19 @@ In the app:
 
 The address field can only be edited while disconnected.
 
+### Voice
+
+A `say` command is spoken with `AVSpeechSynthesizer` in the language it gives (`es-ES` by
+default). The audio session is `.playback` with the `.spokenAudio` mode, so the speech goes to the
+active Bluetooth output, which is the glasses' speakers whenever they are connected, and other
+audio is lowered while it plays. A new phrase interrupts the one being spoken, because only the
+latest advice matters. Every phrase is logged together with the output it went to, and the
+**Voice** section shows the current output with a **Test voice** button that works without the
+PC. A `status` command only updates **Status → PC status**.
+
+From the PC: type `say pide carta` in the terminal of `pc_receiver.py`, or call
+`BridgeSource.say("Pide carta")` in the pipeline.
+
 ## 6. Protocol (iPhone ↔ PC contract)
 
 The PC is the TCP server on port **5050** and the iPhone is the client. Every message is
@@ -132,9 +145,11 @@ when Bluetooth cannot keep up (the app logs every size change and re-sends HELLO
 
 - With the official sample, 720×1280 at 15 fps gave exactly 15 fps. Asking for 24 fps still gave
   15 fps.
-- Over the bridge on a real table the SDK settles at **360×640 @ 15 fps**, which is what we use.
-  Choose it in the app from the start so the frame size does not change mid-stream (the camera
-  calibration is only valid for one resolution).
+- On a 2.4 GHz hotspot the SDK dropped to 360×640. On the **5 GHz** hotspot **720×1280 @ 15 fps**
+  holds (28 s at a steady 15.0 fps on 2026-11-18), and that is the resolution to use: the three
+  resolutions have the same field of view, and the cards need the pixels (at 360×640 a third of
+  them are never recognised). Choose it in the app from the start so the frame size does not
+  change mid-stream.
 
 ## 8. Troubleshooting
 
@@ -149,10 +164,12 @@ when Bluetooth cannot keep up (the app logs every size change and re-sends HELLO
 | Receiver prints "message too large (1163141167 bytes)" | Something else (a browser) opened the port. The address goes in the app, not in a browser. |
 | Resolution drops to 504×896 or 360×640, then the connection dies | Hotspot on 2.4 GHz. Switch to 5 GHz. |
 | The app logs "TCP client is not implemented yet" | An old build is installed. Check Status → App version. |
+| `say` is heard from the iPhone, not the glasses | The glasses are not the Bluetooth audio output. Check **Voice → Output** (it should name the glasses) and pick them in Control Center → AirPlay. |
+| Nothing is heard | Ring/silent switch or volume. Try **Test voice**. The log says which output each phrase went to. |
+| The app stops opening after a week | The free Apple ID signature expired (7 days). Install the last `.ipa` again with Sideloadly. |
 
 ## 9. Status
 
-- Steps 0-3 done: feasibility, CI build, glasses video on screen, TCP client (HELLO, FRAME,
-  LOG, COMMAND shown in the app).
-- Step 4 pending: speak `say` commands through the glasses with `AVSpeechSynthesizer`.
-- Known issue: the app reports version `1.0 (1)` because XcodeGen writes default version keys.
+- Steps 0-4 done: feasibility, CI build, glasses video on screen, TCP client (HELLO, FRAME,
+  LOG, COMMAND) and `say` spoken through the glasses.
+- Since 0.2.0 the app reports its real version, `0.2.0 (<CI run number>)`.

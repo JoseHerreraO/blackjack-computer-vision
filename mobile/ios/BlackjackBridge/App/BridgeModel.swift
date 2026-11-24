@@ -22,6 +22,7 @@ final class BridgeModel {
 
     let log: LogStore
     let glasses: GlassesController
+    let speaker: Speaker
     let pc: PCClient
 
     /// PC receiver as "host:port", persisted in UserDefaults.
@@ -42,6 +43,8 @@ final class BridgeModel {
     /// Frames written to the PC per second, averaged over the last two seconds.
     var sendFps = 0.0
     var lastCommand: String?
+    /// Last "status" text sent by the PC (e.g. the current count or the round state).
+    var statusText: String?
 
     var serverAddress: ServerAddress? { ServerAddress(serverAddressText) }
 
@@ -82,6 +85,7 @@ final class BridgeModel {
         let pc = PCClient(appVersion: Self.appVersion, stream: Self.streamInfo(resolution, frameRate))
         self.pc = pc
         glasses = GlassesController(wearables: Wearables.shared, log: log, frameSink: pc)
+        speaker = Speaker(log: log)
         // Every log line also goes to the PC (dropped while disconnected).
         log.onEntry = { [weak pc] entry in pc?.sendLog(entry.line) }
 
@@ -143,7 +147,7 @@ final class BridgeModel {
         }
     }
 
-    /// Shows and logs commands from the PC. Speaking them is step 4.
+    /// "say" is spoken through the glasses, "status" is shown on screen.
     private func handleCommand(_ payload: Data) {
         guard let command = try? JSONDecoder().decode(BridgeProtocol.Command.self, from: payload) else {
             log.add("Unreadable command: \(String(decoding: payload, as: UTF8.self))")
@@ -151,7 +155,15 @@ final class BridgeModel {
         }
         let text = command.text ?? ""
         lastCommand = "\(command.type): \(text)"
-        log.add("Command \(command.type): \(text)")
+        switch command.type {
+        case "say":
+            speaker.say(text, language: command.lang)
+        case "status":
+            statusText = text
+            log.add("Status: \(text)")
+        default:
+            log.add("Unknown command type \"\(command.type)\"")
+        }
     }
 
     private static func streamInfo(_ resolution: StreamResolution, _ frameRate: UInt) -> StreamInfo {

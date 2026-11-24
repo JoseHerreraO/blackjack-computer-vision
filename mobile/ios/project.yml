@@ -14,7 +14,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.2.0"
     CURRENT_PROJECT_VERSION: "1"
     TARGETED_DEVICE_FAMILY: "1" # iPhone only
     CODE_SIGN_STYLE: Automatic
@@ -44,6 +44,9 @@ targets:
       path: Generated/Info.plist
       properties:
         CFBundleDisplayName: BJ Bridge
+        # XcodeGen writes 1.0 (1) unless the version keys point at the build settings.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
