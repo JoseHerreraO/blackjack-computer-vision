@@ -109,7 +109,8 @@ def evaluate(recognizer, images, truth, paths, errors_dir: Path | None) -> None:
             images, truth, paths, predictions, card_ok, strict=True
         ):
             if not ok:
-                guess = prediction.card.code if prediction.card else f"{prediction.rank.value}?"
+                # "x" for an unread suit: "?" is not allowed in Windows file names.
+                guess = prediction.card.code if prediction.card else f"{prediction.rank.value}x"
                 write_image(errors_dir / f"{card.code}_as_{guess}_{path.stem}.png", image)
         print(f"Errors saved to {errors_dir}")
 

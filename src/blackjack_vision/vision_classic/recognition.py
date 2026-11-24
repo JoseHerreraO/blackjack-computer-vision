@@ -50,10 +50,16 @@ logger = logging.getLogger(__name__)
 MODEL_FORMAT_VERSION = 2
 RED_INK_THRESHOLD = 0.45
 """Share of red ink above which a card is red. Real red ink from the glasses is orange-ish and
-pale; on the 18/11 recording red cards measured 0.59-0.80 and black ones 0.00-0.30."""
+pale. With the brightness condition (``RED_MIN_VALUE``), number cards and aces measured 0.70-1.00
+(red) and 0.00-0.04 (black) on the 18/11 recording, and 0.80-1.00 (red) and 0.00-0.35 (black) on
+the 52-card recording of 23/11."""
 RED_HUE_MAX = 20
 RED_HUE_MIN = 165
 RED_MIN_SATURATION = 45
+RED_MIN_VALUE = 110
+"""Under warm light black ink turns dark brown (hue about 19, saturation about 60, value about
+81 on the 23/11 recording), which the hue and saturation alone took for red: 543 of 2,091 black
+cards read as red. Real red ink is bright (value about 210), so dark pixels are not red."""
 CARD_MARGIN = 0.04
 """Border of the rectified card left out of colour measurements (table pixels may leak in)."""
 PICTURE_SIZE = 0.5
@@ -466,12 +472,13 @@ def picture_box(card: np.ndarray, margin: float = CARD_MARGIN) -> tuple[int, int
 def red_ink_fraction(card: np.ndarray, margin: float = CARD_MARGIN) -> float:
     """Fraction of the ink of a rectified card that is red (HSV, Tema 2).
 
-    Ink pixels are found with Otsu's threshold on the minimum of the B, G and R channels (dark for
-    ink of any colour). A pixel is red when its hue is within ``RED_HUE_MAX`` of red and its
-    saturation is at least ``RED_MIN_SATURATION``. The whole card body is used, not only the index
-    corners: in the glasses video the indices are small and pale, and real red ink is more orange
-    and less saturated than a pure red. The picture of a face card (:func:`picture_box`) is left
-    out, because its artwork has red and yellow in black cards too.
+        Ink pixels are found with Otsu's threshold on the minimum of the B, G and R channels (dark for
+        ink of any colour). A pixel is red when its hue is within ``RED_HUE_MAX`` of red and its
+        saturation is at least ``RED_MIN_SATURATION`` and it is bright (``RED_MIN_VALUE``), because
+    black ink under warm light is a dark brown with a red hue. The whole card body is used, not only the index
+        corners: in the glasses video the indices are small and pale, and real red ink is more orange
+        and less saturated than a pure red. The picture of a face card (:func:`picture_box`) is left
+        out, because its artwork has red and yellow in black cards too.
     """
     if card.ndim != 3:
         return 0.0
@@ -482,8 +489,12 @@ def red_ink_fraction(card: np.ndarray, margin: float = CARD_MARGIN) -> float:
         x, y, w, h = box
         ink[y : y + h, x : x + w] = False
     hsv = cv2.cvtColor(body, cv2.COLOR_BGR2HSV)
-    hue, saturation = hsv[..., 0].astype(int), hsv[..., 1].astype(int)
-    red = ((hue <= RED_HUE_MAX) | (hue >= RED_HUE_MIN)) & (saturation >= RED_MIN_SATURATION)
+    hue, saturation, value = (hsv[..., i].astype(int) for i in range(3))
+    red = (
+        ((hue <= RED_HUE_MAX) | (hue >= RED_HUE_MIN))
+        & (saturation >= RED_MIN_SATURATION)
+        & (value >= RED_MIN_VALUE)
+    )
     count = int(ink.sum())
     return float((red & ink).sum() / count) if count else 0.0
 

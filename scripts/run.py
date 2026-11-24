@@ -11,7 +11,7 @@
 Examples::
 
     set BJ_SECRET=SHDC
-    python scripts/run.py --source bridge --model data/models/recognizer.joblib
+    python scripts/run.py --source bridge --model data/models/recognizer.joblib   # hybrid recogniser
     python scripts/run.py --source bridge --recognizer embedding --no-lock
     python scripts/run.py --source data/samples/<folder> --fps 15 --no-lock --recognizer embedding \
         --no-window --save outputs/demo.mp4
@@ -58,6 +58,7 @@ from blackjack_vision.security.aces import (
 from blackjack_vision.ui.hud import draw_hud
 from blackjack_vision.vision_classic.mat import mat_in_view
 from blackjack_vision.vision_classic.rectify import rectify_card
+from blackjack_vision.vision_dl.hybrid_recognizer import RECOGNIZERS, load_recognizer
 
 WINDOW = "Blackjack assistant"
 PREVIEW_MAX_HEIGHT = 760
@@ -72,7 +73,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", default="bridge", help="bridge[:port], camera, video or images")
     parser.add_argument("--fps", type=float, help="nominal rate of an image folder")
     parser.add_argument("--view", choices=VIEWS, help="camera view (glasses for bridge sources)")
-    parser.add_argument("--recognizer", choices=("classic", "embedding"), default="classic")
+    parser.add_argument(
+        "--recognizer",
+        choices=RECOGNIZERS,
+        default="hybrid",
+        help="hybrid: classical rank + embedding suit (default); classic; embedding",
+    )
     parser.add_argument("--model", type=Path, default=Path("data/models/recognizer.joblib"))
     parser.add_argument("--min-confidence", type=float, help="classic: rank confidence threshold")
     parser.add_argument(
@@ -123,22 +129,14 @@ class Feedback:
             self.bridge.status(text)
 
 
-def load_recognizer(args: argparse.Namespace):
-    if args.recognizer == "classic":
-        from blackjack_vision.vision_classic.recognition import CardRecognizer
-
-        if not args.model.is_file():
-            raise SystemExit(
-                f"Classic model not found: {args.model}. Train it with scripts/train_recognizer.py "
-                "or use --recognizer embedding."
-            )
-        recognizer = CardRecognizer.load(args.model)
-        if args.min_confidence is not None:
-            recognizer.min_rank_confidence = args.min_confidence
-        return recognizer
-    from blackjack_vision.vision_dl.embedding_recognizer import EmbeddingRecognizer
-
-    return EmbeddingRecognizer.load(args.embedding_model, threshold=args.threshold)
+def build_recognizer(args: argparse.Namespace):
+    return load_recognizer(
+        args.recognizer,
+        model=args.model,
+        embedding_model=args.embedding_model,
+        threshold=args.threshold,
+        min_confidence=args.min_confidence,
+    )
 
 
 def build_security(args: argparse.Namespace) -> tuple[SecuritySystem, object] | None:
@@ -176,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s"
     )
     view_name = args.view or default_view(args.source)
-    recognizer = load_recognizer(args)
+    recognizer = build_recognizer(args)
     security = build_security(args)
     pipeline = CardPipeline(recognizer, detector=CardDetector(config_for_view(view_name)))
     table = Table(decks=args.decks, dealer_line=args.dealer_line)
