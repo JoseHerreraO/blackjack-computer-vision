@@ -221,7 +221,11 @@ def main(argv: list[str] | None = None) -> int:
                     # Only needed when no card is seen: empty table, or head turned away?
                     on_mat = mat_in_view(image) if not result.cards else None
                     update = table.update(
-                        result.cards, result.new_cards, image.shape[0], mat_in_view=on_mat
+                        result.cards,
+                        result.new_cards,
+                        image.shape[0],
+                        mat_in_view=on_mat,
+                        motion=result.motion,
                     )
                     for event in update.events:
                         logger.info(event)

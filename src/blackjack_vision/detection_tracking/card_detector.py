@@ -37,8 +37,16 @@ Pipeline:
    pitch still moves it, but it decides between near-equal explanations. With the glasses use
    :meth:`CardDetectorConfig.for_glasses`, which starts from 0.5.
 
-Blobs large enough to hold a card that fail the shape checks are returned as *clusters*: usually
-several overlapping cards of one hand, which a later stage can split.
+   A single frame can still mislead the estimate: a double blob of two touching cards looks like
+   one card for the wrong ``c``. A jump of the estimate (more than ``foreshortening_jump`` in
+   log scale) is therefore adopted only after ``foreshortening_confirm_frames`` frames in a row
+   agree on it. The head pitch never changes that fast, a passing blob does.
+
+7. **Clusters** (:func:`~blackjack_vision.vision_classic.split_cards.split_cluster`). Blobs large
+   enough to hold a card that fail the shape checks are usually two or more touching or
+   overlapping cards. They are split into single cards from the whole sides of their outline,
+   on the shape corrected for the foreshortening. What cannot be split stays in
+   ``DetectionResult.clusters``.
 
 Example::
 
@@ -50,13 +58,20 @@ Example::
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 import cv2
 import numpy as np
 
-from blackjack_vision.vision_classic.corners import aspect_ratio, order_corners, refine_corners
+from blackjack_vision.vision_classic.corners import (
+    aspect_ratio,
+    order_corners,
+    refine_corners,
+    side_lengths,
+)
+from blackjack_vision.vision_classic.mat import MAT_HUE_RANGE, mat_mask
+from blackjack_vision.vision_classic.split_cards import SplitConfig, split_cluster
 
 CARD_ASPECT_RATIO = 88.0 / 63.0
 """Long side over short side of a standard poker-size card."""
@@ -103,6 +118,21 @@ class CardDetectorConfig:
             one (``0`` = every frame on its own).
         candidate_aspect_range: Raw aspect ratios a quadrilateral may have to take part in the
             estimation.
+        foreshortening_jump: Change of the estimate, as ``|log(new / current)|``, that counts as
+            a jump and needs confirming.
+        foreshortening_confirm_frames: Frames in a row that must agree on a jump before it is
+            adopted (``1`` adopts every estimate at once).
+        split_clusters: Split blobs of touching or overlapping cards into single cards.
+        split: Parameters of the cluster split.
+        split_mat_hue: Hue range of the mat (OpenCV 0-180). When set, only clusters lying on
+            the mat (at least ``split_min_mat`` of a thin ring around them has the mat colour)
+            are split: hands, faces and objects off the table are skipped, which saves time and
+            false cards. ``None`` splits every cluster.
+        split_min_mat: See ``split_mat_hue``.
+        split_size_ratio: A card split from a cluster is kept only if its short side is within
+            this factor of the single card found nearest to it in height in the same frame
+            (cards at the same distance from the camera have the same size). It rejects strips
+            of a single card cut the wrong way.
     """
 
     segmentation: Segmentation = Segmentation.WHITENESS
@@ -125,6 +155,13 @@ class CardDetectorConfig:
     foreshortening_default: float = 1.0
     foreshortening_prior_weight: float = 0.1
     candidate_aspect_range: tuple[float, float] = (1.0, 3.2)
+    foreshortening_jump: float = 0.25
+    foreshortening_confirm_frames: int = 5
+    split_clusters: bool = True
+    split: SplitConfig = field(default_factory=SplitConfig)
+    split_mat_hue: tuple[int, int] | None = None
+    split_min_mat: float = 0.5
+    split_size_ratio: float = 1.25
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segmentation", Segmentation(self.segmentation))
@@ -145,14 +182,20 @@ class CardDetectorConfig:
             raise ValueError("foreshortening_prior_weight must be >= 0")
         if self.foreshortening is not None and not 0.0 < self.foreshortening <= 1.0:
             raise ValueError(f"foreshortening must be in (0, 1], got {self.foreshortening}")
+        if self.foreshortening_confirm_frames < 1:
+            raise ValueError("foreshortening_confirm_frames must be >= 1")
         f_low, f_high = self.foreshortening_range
         if not 0.0 < f_low < f_high <= 1.0:
             raise ValueError(f"Invalid foreshortening_range {self.foreshortening_range}")
 
     @classmethod
     def for_glasses(cls, **overrides: object) -> CardDetectorConfig:
-        """Settings for the Meta glasses looking down at the table (table squashed to ~0.5)."""
-        return cls(**{"foreshortening_default": 0.5, **overrides})
+        """Settings for the Meta glasses looking down at the table (table squashed to ~0.5).
+
+        Clusters are split only on our teal mat (see :mod:`blackjack_vision.vision_classic.mat`).
+        """
+        defaults = {"foreshortening_default": 0.5, "split_mat_hue": MAT_HUE_RANGE}
+        return cls(**{**defaults, **overrides})
 
 
 VIEWS = ("glasses", "top")
@@ -186,13 +229,16 @@ class CardDetection:
     Attributes:
         corners: ``(4, 2)`` ``float32`` corners ordered top-left, top-right, bottom-right,
             bottom-left in portrait orientation (see :func:`order_corners`).
-        contour: Dense external contour of the blob, ``(N, 1, 2)`` ``int32``.
-        area: Blob area in pixels.
+        contour: Dense external contour of the blob, ``(N, 1, 2)`` ``int32`` (for a card split
+            from a cluster, the contour of the whole cluster).
+        area: Blob area in pixels (for a split card, the area of its quadrilateral).
+        split: Whether the card was split from a cluster of touching or overlapping cards.
     """
 
     corners: np.ndarray
     contour: np.ndarray
     area: float
+    split: bool = False
 
     @property
     def center(self) -> np.ndarray:
@@ -215,12 +261,15 @@ class DetectionResult:
             overlapping cards).
         mask: Binary card mask after morphology (``uint8``, 0 or 255).
         foreshortening: Vertical scale of the table used for the shape checks (``1`` = none).
+        cut: Contours of blobs cut by the image border (not cards themselves, but they may hide a
+            known card next to a cut one, see the pipeline).
     """
 
     cards: list[CardDetection] = field(default_factory=list)
     clusters: list[np.ndarray] = field(default_factory=list)
     mask: np.ndarray | None = None
     foreshortening: float = 1.0
+    cut: list[np.ndarray] = field(default_factory=list)
 
 
 class CardDetector:
@@ -233,6 +282,7 @@ class CardDetector:
     def __init__(self, config: CardDetectorConfig | None = None) -> None:
         self.config = config or CardDetectorConfig()
         self._last_foreshortening: float | None = None
+        self._pending_foreshortening: tuple[float, int] | None = None
         self._open_kernel = _ellipse(self.config.open_ksize)
         self._close_kernel = _ellipse(self.config.close_ksize)
 
@@ -279,11 +329,15 @@ class CardDetector:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         result = DetectionResult(mask=mask)
         candidates: list[tuple[np.ndarray, np.ndarray, float]] = []
+        # Blobs cut by the border: a card only partly visible is no card, but a blob of touching
+        # cards cut by the border may still hold whole cards (split below, the cut ones dropped).
+        border_blobs: list[np.ndarray] = []
         for contour in contours:
             area = float(cv2.contourArea(contour))
             if not min_area <= area <= max_area:
                 continue
             if config.border_margin >= 0 and _touches_border(contour, width, height, config):
+                border_blobs.append(contour)
                 continue
             corners = self._fit_quad(contour, area)
             if corners is None:
@@ -302,25 +356,89 @@ class CardDetector:
                 prior_weight=config.foreshortening_prior_weight,
             )
             if estimate is not None:
-                self._last_foreshortening = estimate
+                self._accept_foreshortening(estimate)
             scale = self._last_foreshortening or config.foreshortening_default
         result.foreshortening = scale
+        result.cut = border_blobs
 
         low, high = config.aspect_range
+        quad_blobs: list[np.ndarray] = []  # clean quadrilaterals with the wrong aspect ratio
         for corners, contour, area in candidates:
             corrected = _stretch(corners, 1.0 / scale)
             if not low <= aspect_ratio(corrected) <= high:
                 result.clusters.append(contour)
+                quad_blobs.append(contour)
                 continue
-            # Order the corners on the corrected shape so that 0 -> 1 is a real short side.
-            ordered = _stretch(order_corners(corrected), scale).astype(np.float32)
-            result.cards.append(CardDetection(ordered, contour, area))
+            result.cards.append(CardDetection(_portrait(corners, scale), contour, area))
+
+        if config.split_clusters:
+            kept = []
+            mat = None
+            singles = [card.corners for card in result.cards]
+            for contour in result.clusters + border_blobs:
+                cut = any(contour is blob for blob in border_blobs)
+                if config.split_mat_hue is not None and image.ndim == 3:
+                    if mat is None:
+                        mat = mat_mask(image, hue_range=config.split_mat_hue)
+                    if _mat_around(contour, mat) < config.split_min_mat:
+                        if not cut:
+                            kept.append(contour)
+                        continue
+                split_config = config.split
+                if cut:
+                    # Part of the blob is outside the image, so it cannot be fully explained;
+                    # one whole card is enough, but it must follow the edges closely.
+                    split_config = replace(
+                        split_config,
+                        min_cards=1,
+                        min_coverage=0.0,
+                        min_support=max(split_config.min_support, 0.75),
+                    )
+                elif any(contour is blob for blob in quad_blobs):
+                    # A clean quadrilateral with the wrong aspect ratio is not split: cards side
+                    # by side and one card seen at an odd angle look the same (a 2:1.4 block is
+                    # two upright cards or one sideways card), so guessing would invent cards.
+                    kept.append(contour)
+                    continue
+                parts = split_cluster(contour, scale, image, split_config)
+                if cut:
+                    parts = [q for q in parts if not _quad_near_border(q, width, height, config)]
+                parts = [q for q in parts if _size_fits(q, singles, scale, config.split_size_ratio)]
+                if not parts:
+                    if not cut:
+                        kept.append(contour)
+                    continue
+                for corners in parts:
+                    quad_area = float(cv2.contourArea(corners.reshape(-1, 1, 2)))
+                    card = CardDetection(_portrait(corners, scale), contour, quad_area, True)
+                    result.cards.append(card)
+            result.clusters = kept
         result.cards.sort(key=lambda card: (card.center[0], card.center[1]))
         return result
 
     def reset(self) -> None:
         """Forget the last foreshortening estimate (for example when switching sources)."""
         self._last_foreshortening = None
+        self._pending_foreshortening = None
+
+    def _accept_foreshortening(self, estimate: float) -> None:
+        """Adopt an estimate at once if it is close to the current one, a jump once confirmed."""
+        config = self.config
+        current = self._last_foreshortening
+        if current is None or abs(np.log(estimate / current)) <= config.foreshortening_jump:
+            self._last_foreshortening = estimate
+            self._pending_foreshortening = None
+            return
+        pending = self._pending_foreshortening
+        if pending is not None and abs(np.log(estimate / pending[0])) <= config.foreshortening_jump:
+            count = pending[1] + 1
+        else:
+            count = 1
+        if count >= config.foreshortening_confirm_frames:
+            self._last_foreshortening = estimate
+            self._pending_foreshortening = None
+        else:
+            self._pending_foreshortening = (estimate, count)
 
     def _fit_quad(self, contour: np.ndarray, area: float) -> np.ndarray | None:
         """Refined corners if the blob is a well-filled quadrilateral, otherwise ``None``."""
@@ -384,6 +502,11 @@ def estimate_foreshortening(
     return best_scale
 
 
+def _portrait(corners: np.ndarray, scale: float) -> np.ndarray:
+    """Corners ordered on the shape corrected by ``1 / scale``, so that 0 -> 1 is a short side."""
+    return _stretch(order_corners(_stretch(corners, 1.0 / scale)), scale).astype(np.float32)
+
+
 def _stretch(corners: np.ndarray, factor: float) -> np.ndarray:
     """Scale the y coordinate of a quadrilateral by ``factor``."""
     stretched = np.asarray(corners, dtype=np.float64).reshape(-1, 2).copy()
@@ -424,6 +547,49 @@ def _ellipse(size: int) -> np.ndarray | None:
 
 def _as_bgr(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if image.ndim == 2 else image
+
+
+def _size_fits(
+    corners: np.ndarray, singles: list[np.ndarray], scale: float, max_ratio: float
+) -> bool:
+    """Whether a split card is about as big as the single card nearest to it in height."""
+    if not singles:
+        return True
+    y = float(corners[:, 1].mean())
+    nearest = min(singles, key=lambda other: abs(float(other[:, 1].mean()) - y))
+    ratio = _short(corners, scale) / _short(nearest, scale)
+    return 1.0 / max_ratio <= ratio <= max_ratio
+
+
+def _short(corners: np.ndarray, scale: float) -> float:
+    sides = side_lengths(_stretch(corners, 1.0 / scale))
+    return float(min(sides))
+
+
+def _mat_around(contour: np.ndarray, mat: np.ndarray, width: int = 6) -> float:
+    """Fraction of a ring ``width`` pixels wide around the blob that is mat."""
+    x, y, w, h = cv2.boundingRect(contour)
+    x0, y0 = max(x - width, 0), max(y - width, 0)
+    x1, y1 = min(x + w + width, mat.shape[1]), min(y + h + width, mat.shape[0])
+    blob = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.drawContours(blob, [contour - np.array([x0, y0], np.int32)], -1, 255, -1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * width + 1, 2 * width + 1))
+    ring = cv2.dilate(blob, kernel) & ~blob
+    total = np.count_nonzero(ring)
+    return float(np.count_nonzero(ring & mat[y0:y1, x0:x1])) / total if total else 0.0
+
+
+def _quad_near_border(
+    corners: np.ndarray, width: int, height: int, config: CardDetectorConfig
+) -> bool:
+    margin = max(config.border_margin, 0) + 2
+    x, y = corners[:, 0], corners[:, 1]
+    return bool(
+        x.min() <= margin
+        or y.min() <= margin
+        or x.max() >= width - 1 - margin
+        or y.max() >= height - 1 - margin
+    )
 
 
 def _touches_border(

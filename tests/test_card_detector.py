@@ -108,12 +108,24 @@ def test_white_shapes_that_are_not_cards_are_rejected():
     assert len(result.clusters) == 3  # the speck is not even a candidate
 
 
-def test_overlapping_cards_are_reported_as_a_cluster():
+def test_overlapping_cards_are_reported_as_a_cluster_without_splitting():
+    first = placed_corners((300, 240), 220)
+    second = first + np.array([60, 45], np.float32)
+    scene = scene_with_cards([first, second])
+    result = CardDetector(CardDetectorConfig(split_clusters=False)).detect(scene)
+    assert result.cards == []
+    assert len(result.clusters) == 1
+
+
+def test_overlapping_cards_are_split_into_both_cards():
     first = placed_corners((300, 240), 220)
     second = first + np.array([60, 45], np.float32)
     result = CardDetector().detect(scene_with_cards([first, second]))
-    assert result.cards == []
-    assert len(result.clusters) == 1
+    assert not result.clusters
+    assert len(result.cards) == 2
+    assert all(card.split for card in result.cards)
+    for expected, card in zip((first, second), result.cards, strict=True):
+        assert match_corners(card.corners, expected) < 7.0  # ~3 % of the card
 
 
 def test_card_cut_by_the_image_border_is_ignored():
