@@ -10,7 +10,9 @@ Examples::
     python scripts/track_cards.py --source data/samples/<folder> --fps 15
     python scripts/track_cards.py --source data/samples/<folder> --no-window --save out.mp4
 
-The recogniser is the classical one by default (bag of words + SVM for the rank, NCC templates
+The recogniser is the hybrid one by default (``vision_dl/hybrid_recognizer.py``: the rank from the
+classical recogniser, the suit from the embeddings, 97.3 % of cards right on the glasses
+footage). ``--recognizer classic`` is the classical one alone (bag of words + SVM for the rank, NCC templates
 for the suit; train it with ``scripts/train_recognizer.py``), which is the one the course syllabus
 covers. ``--recognizer embedding`` uses the learned embedding recogniser instead, for comparison
 (needs ``scripts/download_card_recognizer.py``). ``--no-recognition`` only detects and tracks.
@@ -32,6 +34,7 @@ import numpy as np
 from blackjack_vision.capture.sources import open_source, write_image
 from blackjack_vision.detection_tracking.card_detector import CardDetector, CardDetectorConfig
 from blackjack_vision.detection_tracking.pipeline import CardPipeline, PipelineResult
+from blackjack_vision.vision_dl.hybrid_recognizer import RECOGNIZERS, load_recognizer
 
 WINDOW = "cards"
 PREVIEW_MAX_HEIGHT = 760
@@ -47,9 +50,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fps", type=float, help="nominal rate of an image folder")
     parser.add_argument(
         "--recognizer",
-        choices=("classic", "embedding"),
-        default="classic",
-        help="classic: bag of words + SVM and NCC templates (syllabus); embedding: learned model",
+        choices=RECOGNIZERS,
+        default="hybrid",
+        help="hybrid (default): classical rank + embedding suit; classic: bag of words + SVM and "
+        "NCC templates (syllabus); embedding: learned model",
     )
     parser.add_argument(
         "--model", type=Path, default=Path("data/models/recognizer.joblib"), help="classic model"
@@ -116,25 +120,14 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s"
     )
     recognizer = None
-    if args.no_recognition:
-        pass
-    elif args.recognizer == "classic":
-        from blackjack_vision.vision_classic.recognition import CardRecognizer
-
-        if not args.model.is_file():
-            print(
-                f"Classic model not found: {args.model}. Train it with scripts/train_recognizer.py "
-                "or use --recognizer embedding / --no-recognition",
-                file=sys.stderr,
-            )
-            return 2
-        recognizer = CardRecognizer.load(args.model)
-        if args.min_confidence is not None:
-            recognizer.min_rank_confidence = args.min_confidence
-    else:
-        from blackjack_vision.vision_dl.embedding_recognizer import EmbeddingRecognizer
-
-        recognizer = EmbeddingRecognizer.load(args.embedding_model, threshold=args.threshold)
+    if not args.no_recognition:
+        recognizer = load_recognizer(
+            args.recognizer,
+            model=args.model,
+            embedding_model=args.embedding_model,
+            threshold=args.threshold,
+            min_confidence=args.min_confidence,
+        )
     config = CardDetectorConfig.for_glasses() if args.view == "glasses" else CardDetectorConfig()
     pipeline = CardPipeline(
         recognizer,
