@@ -5,7 +5,10 @@ every frame and a single misread would change its label. The tracker gives every
 ID across frames:
 
 1. Each track predicts where its card is now with a constant-velocity Kalman filter
-   (``cv2.KalmanFilter``) on the box centre and size.
+   (``cv2.KalmanFilter``) on the box centre and size. When the camera moved (the glasses are on
+   the head), the motion of the whole image between the two frames
+   (:class:`~blackjack_vision.vision_classic.camera_motion.CameraMotion`) is applied to every
+   track first, so the prediction follows a head turn instead of staying where the card was.
 2. Predicted boxes and new detections are matched with the Hungarian algorithm
    (``scipy.optimize.linear_sum_assignment``) on ``1 - IoU``. What is left is matched a second
    time by label and centre distance, so a card keeps its ID when a head turn moves it further
@@ -64,6 +67,20 @@ class BoxKalmanFilter:
 
     def predict(self) -> np.ndarray:
         return self._box(self._kf.predict())
+
+    def move(self, transform: np.ndarray) -> None:
+        """Apply a camera motion (``2 x 3`` similarity) to the estimated box.
+
+        The centre is moved and the size scaled. The velocity is left alone: it is the card's own
+        motion on the table, which the camera motion does not change.
+        """
+        state = self._kf.statePost.copy()
+        centre = transform[:, :2] @ state[:2, 0].astype(np.float64) + transform[:, 2]
+        scale = float(np.sqrt(abs(np.linalg.det(transform[:, :2]))))
+        state[0, 0], state[1, 0] = centre
+        state[2, 0] *= scale
+        state[3, 0] *= scale
+        self._kf.statePost = state.astype(np.float32)
 
     def correct(self, box: np.ndarray) -> np.ndarray:
         return self._box(self._kf.correct(_to_measurement(box)))
@@ -185,7 +202,19 @@ class CardTracker:
         self.tracks.clear()
         self._next_id = 1
 
-    def update(self, detections: Sequence[Detection]) -> TrackerUpdate:
+    def update(
+        self, detections: Sequence[Detection], motion: np.ndarray | None = None
+    ) -> TrackerUpdate:
+        """Match the detections of a new frame to the tracks.
+
+        Args:
+            detections: Detections of this frame.
+            motion: ``2 x 3`` transform from the previous frame to this one (camera motion),
+                applied to every track before predicting. ``None`` = the camera did not move.
+        """
+        if motion is not None:
+            for track in self.tracks:
+                track.filter.move(motion)
         predicted = np.array([track.filter.predict() for track in self.tracks]).reshape(-1, 4)
         for track in self.tracks:
             track.age += 1

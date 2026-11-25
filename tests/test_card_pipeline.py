@@ -75,7 +75,7 @@ def test_without_recognizer_cards_stay_unknown(table):
     for _ in range(8):
         result = pipeline.process(image)
     assert len(result.cards) == n_cards and all(card.label == "?" for card in result.cards)
-    assert set(result.timings_ms) == {"detect", "track", "recognise"}
+    assert set(result.timings_ms) == {"detect", "motion", "merge", "track", "recognise"}
 
 
 def test_card_that_leaves_is_forgotten(table):
