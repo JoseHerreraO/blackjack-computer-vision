@@ -73,11 +73,22 @@ def draw_hud(
     thick = max(1, round(2 * s))
 
     if table is not None and not locked:
-        line_y = int(table.dealer_line * height)
-        for x in range(0, width, int(30 * s) or 1):
+        # The line between the zones as the table uses it: below the mat's far edge when it is
+        # known (it moves with the head), the fixed line otherwise.
+        heights = [_card_height(card.corners) for card in cards if card.corners is not None]
+        card_height = float(np.median(heights)) if heights else 0.08 * height
+        line = table.boundary(width, height, card_height)
+        step = int(30 * s) or 1
+        for x in range(0, width, step):
+            x2 = min(x + int(15 * s), width - 1)
             cv2.line(
-                view, (x, line_y), (x + int(15 * s), line_y), (200, 200, 200), max(1, thick // 2)
+                view,
+                (x, int(line[x])),
+                (x2, int(line[x2])),
+                (200, 200, 200),
+                max(1, thick // 2),
             )
+        line_y = int(line[0])
         _text(view, "DEALER", (int(10 * s), line_y - int(8 * s)), 0.5 * s, DEALER_BGR, thick)
         _text(view, "PLAYER", (int(10 * s), line_y + int(22 * s)), 0.5 * s, PLAYER_BGR, thick)
 
@@ -88,7 +99,10 @@ def draw_hud(
         if locked or table is None:
             colour, label = PENDING_BGR, card.card.code if card.card else ""
         else:
-            zone = table.zone_of(card, height)
+            # A dealt card keeps the zone it was dealt to; the others use the table's rule.
+            zone = table.dealt_zone(card.track_id) if card.card is not None else None
+            if zone is None:
+                zone = table.zone_of(card, height, table.mat_edge)
             if card.card is None:
                 hole = table.hole_card_visible and zone is Zone.DEALER
                 colour, label = PENDING_BGR, "HOLE" if hole else "?"
@@ -108,6 +122,11 @@ def draw_hud(
     if table is not None and not locked and panel:
         _draw_panel(view, table, s, thick)
     return view
+
+
+def _card_height(corners: np.ndarray) -> float:
+    ys = np.asarray(corners, np.float64)[:, 1]
+    return float(ys.max() - ys.min())
 
 
 def _draw_panel(view: np.ndarray, table: Table, s: float, thick: int) -> None:

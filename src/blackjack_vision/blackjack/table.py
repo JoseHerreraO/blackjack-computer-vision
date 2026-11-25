@@ -119,6 +119,8 @@ class Table:
         self.clear_frames = clear_frames
         self.refound_distance = refound_distance
         self.dealer_depth = dealer_depth
+        self.mat_edge: np.ndarray | None = None
+        """Last far edge of the mat given to :meth:`update` (for the HUD)."""
         self.round = Round(rules=self.rules, shoe=self.shoe)
         self.rounds_played = 0
         self.last_results: list[str] = []
@@ -134,6 +136,21 @@ class Table:
     @property
     def advice(self) -> Action | None:
         return self.round.recommendation
+
+    def dealt_zone(self, track_id: int) -> Zone | None:
+        """Zone a recognised card was dealt to (``None`` if it was not dealt by this table)."""
+        return self._zones.get(track_id)
+
+    def boundary(self, image_width: int, image_height: int, card_height: float) -> np.ndarray:
+        """Row of the line between the zones in every column, as :meth:`zone_of` draws it.
+
+        ``mat_edge + dealer_depth * card_height`` when the mat's far edge is known, otherwise the
+        fixed ``dealer_line``.
+        """
+        edge = self.mat_edge
+        if edge is not None and len(edge) == image_width and (edge >= 0).all():
+            return np.asarray(edge, np.float64) + self.dealer_depth * card_height
+        return np.full(image_width, self.dealer_line * image_height)
 
     def zone_of(
         self, card: SeenCard, image_height: int, mat_edge: np.ndarray | None = None
@@ -184,6 +201,8 @@ class Table:
         of the mat in the image is not an empty table.
         """
         update = TableUpdate()
+        if mat_edge is not None:
+            self.mat_edge = mat_edge if (np.asarray(mat_edge) >= 0).any() else None
 
         if not visible:
             self._empty_frames += 1

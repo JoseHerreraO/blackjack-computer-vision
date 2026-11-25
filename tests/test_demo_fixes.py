@@ -177,3 +177,31 @@ def test_card_is_read_once_it_lies_still():
     for _ in range(12):
         result = pipeline.process(_scene((350, 240)))
     assert recognizer.calls == 1 and result.cards[0].card is not None
+
+
+# HUD (review of #32) ------------------------------------------------------------------------------
+
+
+def test_hud_colours_a_card_by_the_zone_it_was_dealt_to():
+    from blackjack_vision.ui.hud import DEALER_BGR, draw_hud
+
+    table = Table(dealer_line=0.5)
+    edge = np.full(720, 700.0)  # head tilted: the far edge of the mat is low in the image
+    up = card_at(360, 760, "9H")  # below the middle of the image, dealer by the mat
+    table.update([up], [up], 1280, mat_edge=edge, image_width=720)
+    assert table.round.dealer.cards  # dealt to the dealer
+
+    image = np.zeros((1280, 720, 3), np.uint8)
+    hud = draw_hud(image, [up], 15.0, table=table, panel=False)
+    x0, y0 = up.corners[0].astype(int)
+    outline = hud[y0 - 1 : y0 + 2, x0 + 5 : x0 + 20].reshape(-1, 3)
+    assert any(tuple(int(v) for v in pixel) == tuple(DEALER_BGR) for pixel in outline)
+
+
+def test_hud_line_follows_the_mat_edge():
+    table = Table(dealer_line=0.5)
+    table.update([], [], 1280, mat_edge=np.full(720, 700.0), image_width=720)
+    line = table.boundary(720, 1280, card_height=80)
+    assert line[0] == pytest.approx(700 + table.dealer_depth * 80)
+    table_without_mat = Table(dealer_line=0.5)
+    assert table_without_mat.boundary(720, 1280, 80)[0] == pytest.approx(640)
