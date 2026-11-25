@@ -143,12 +143,18 @@ class Table:
         image_height: int,
         *,
         mat_in_view: bool | None = None,
+        motion: np.ndarray | None = None,
     ) -> TableUpdate:
         """Feed the cards of one frame (``visible``) and those recognised in it (``new_cards``).
 
         ``mat_in_view`` tells an empty table from a camera looking away (see
         :func:`~blackjack_vision.vision_classic.mat.mat_in_view`). ``None`` means unknown, and then
         an empty view only starts a new round once the current one is over.
+
+        ``motion`` is the camera motion since the previous frame (``2 x 3``, see
+        :class:`~blackjack_vision.vision_classic.camera_motion.CameraMotion`). It moves the last
+        position of the cards out of view, so a card found again after a head turn is still
+        recognised as the same card.
         """
         update = TableUpdate()
 
@@ -170,6 +176,8 @@ class Table:
         for dealt in self._dealt:
             if dealt.track_id in positions:
                 dealt.centre = positions[dealt.track_id]
+            elif motion is not None:
+                dealt.centre = motion[:, :2] @ dealt.centre + motion[:, 2]
 
         for card in new_cards:
             if card.card is None:
