@@ -53,6 +53,7 @@ from blackjack_vision.detection_tracking.card_detector import (
 from blackjack_vision.detection_tracking.tracker import CardTracker
 from blackjack_vision.detection_tracking.yolo_detector import Detection
 from blackjack_vision.vision_classic.camera_motion import CameraMotion, apply_motion
+from blackjack_vision.vision_classic.card_back import is_card_back
 from blackjack_vision.vision_classic.mat import mat_mask
 from blackjack_vision.vision_classic.rectify import rectify_card
 from blackjack_vision.vision_classic.sharpness import fuse, sharpness
@@ -77,6 +78,8 @@ class TrackedCard:
     attempts: int = 0
     """Recognitions tried so far."""
     frames_since_attempt: int = 0
+    face_down: bool = False
+    """The last attempt saw the back of the card (the dealer's hole card): not named."""
     crops: deque[tuple[float, np.ndarray]] = field(default_factory=deque, repr=False)
 
     @property
@@ -121,6 +124,9 @@ class CardPipeline:
             time does not spike.
         track_cover: Fraction of a known card's predicted quadrilateral that a cluster must cover
             for the card to be taken from its track (see "Cards that merge" above).
+        max_speed: A card moving faster than this on the table (camera motion removed), in
+            card diagonals per frame, is not read: it is still being dealt, so it is blurred and
+            on its way to its zone. It is read once it lies still.
     """
 
     def __init__(
@@ -136,6 +142,7 @@ class CardPipeline:
         retry_frames: int = 5,
         max_recognitions_per_frame: int = 2,
         track_cover: float = 0.85,
+        max_speed: float = 0.04,
     ) -> None:
         if not 1 <= fuse_top <= buffer_size or not 1 <= min_crops <= buffer_size:
             raise ValueError("Need 1 <= fuse_top, min_crops <= buffer_size")
@@ -156,6 +163,7 @@ class CardPipeline:
         self.retry_frames = retry_frames
         self.max_recognitions_per_frame = max_recognitions_per_frame
         self.track_cover = track_cover
+        self.max_speed = max_speed
         self._cards: dict[int, TrackedCard] = {}
 
     def reset(self) -> None:
@@ -216,6 +224,9 @@ class CardPipeline:
             if state.recognised or self.recognizer is None:
                 continue
             if id(track.last_detection) in guessed:
+                continue
+            if self._moving(track):
+                state.crops.clear()  # blurred crops on its way: start again once it lies still
                 continue
             crop = rectify_card(image, state.corners)
             state.crops.append((sharpness(crop), crop))
@@ -285,6 +296,12 @@ class CardPipeline:
         found += _rest_of_clusters(clusters, claimed, found, detection.foreshortening)
         return detected + found
 
+    def _moving(self, track) -> bool:
+        box = track.box
+        diagonal = float(np.hypot(box[2] - box[0], box[3] - box[1]))
+        speed = float(np.hypot(*track.filter.velocity))
+        return diagonal > 0 and speed > self.max_speed * diagonal
+
     def _should_try(self, state: TrackedCard) -> bool:
         if len(state.crops) < self.min_crops:
             return False
@@ -292,9 +309,16 @@ class CardPipeline:
 
     def _recognise(self, state: TrackedCard) -> bool:
         fused = fuse([crop for _, crop in state.crops], k=self.fuse_top)
-        result = self.recognizer.recognise(fused)
         state.attempts += 1
         state.frames_since_attempt = 0
+        if is_card_back(fused):
+            # Face down: a recogniser would still name it. Keep it unknown (the table treats it
+            # as the hole card) and start the buffer again, so it is named once turned over.
+            state.face_down = True
+            state.crops.clear()
+            return False
+        state.face_down = False
+        result = self.recognizer.recognise(fused)
         state.similarity = float(result.similarity)
         if result.card is None:
             return False

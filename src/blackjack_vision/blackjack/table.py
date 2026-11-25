@@ -1,8 +1,11 @@
 """Live table: turns the cards the pipeline recognises into a Blackjack round and advice.
 
 The glasses look at the table from the player's seat, so the dealer's cards are on the far side
-(top of the image) and the player's on the near side (bottom). A horizontal ``dealer_line``, as a
-fraction of the image height, separates the two zones. Every card the pipeline names for the first
+(top of the image) and the player's on the near side (bottom). When the far edge of the mat is
+known (:func:`~blackjack_vision.vision_classic.mat.mat_far_edge`), a card whose centre is less than
+``dealer_depth`` card heights below that edge is the dealer's: the edge moves with the head, the
+cards keep their place on the table. Otherwise a horizontal ``dealer_line``, as a fraction of the
+image height, separates the two zones. Every card the pipeline names for the first
 time (:attr:`~blackjack_vision.detection_tracking.pipeline.PipelineResult.new_cards`) is dealt to
 the hand of its zone in :class:`~blackjack_vision.blackjack.game.Round`, which also feeds the
 Hi-Lo count of the shared :class:`~blackjack_vision.blackjack.shoe.ShoeTracker`.
@@ -91,6 +94,9 @@ class Table:
         clear_frames: Frames without cards that start a new round (see the module docstring).
         refound_distance: How far, in card sizes, a lost card may reappear and still be taken
             for the same card.
+        dealer_depth: With the mat's far edge known, how far below it (in heights of the card
+            itself) the dealer's zone reaches. On the 2026-11-25 recording the dealer's cards
+            were about 1 card height below the edge and the player's more than 2.5.
     """
 
     def __init__(
@@ -101,7 +107,8 @@ class Table:
         dealer_line: float = 0.5,
         hidden_frames: int = 15,
         clear_frames: int = 15,
-        refound_distance: float = 1.5,
+        refound_distance: float = 3.0,
+        dealer_depth: float = 1.8,
     ) -> None:
         if not 0.0 < dealer_line < 1.0:
             raise ValueError(f"dealer_line must be in (0, 1), got {dealer_line}")
@@ -111,6 +118,9 @@ class Table:
         self.hidden_frames = hidden_frames
         self.clear_frames = clear_frames
         self.refound_distance = refound_distance
+        self.dealer_depth = dealer_depth
+        self.mat_edge: np.ndarray | None = None
+        """Last far edge of the mat given to :meth:`update` (for the HUD)."""
         self.round = Round(rules=self.rules, shoe=self.shoe)
         self.rounds_played = 0
         self.last_results: list[str] = []
@@ -127,11 +137,40 @@ class Table:
     def advice(self) -> Action | None:
         return self.round.recommendation
 
-    def zone_of(self, card: SeenCard, image_height: int) -> Zone:
-        """Zone of a card by the height of its centre in the image."""
+    def dealt_zone(self, track_id: int) -> Zone | None:
+        """Zone a recognised card was dealt to (``None`` if it was not dealt by this table)."""
+        return self._zones.get(track_id)
+
+    def boundary(self, image_width: int, image_height: int, card_height: float) -> np.ndarray:
+        """Row of the line between the zones in every column, as :meth:`zone_of` draws it.
+
+        ``mat_edge + dealer_depth * card_height`` when the mat's far edge is known, otherwise the
+        fixed ``dealer_line``.
+        """
+        edge = self.mat_edge
+        if edge is not None and len(edge) == image_width and (edge >= 0).all():
+            return np.asarray(edge, np.float64) + self.dealer_depth * card_height
+        return np.full(image_width, self.dealer_line * image_height)
+
+    def zone_of(
+        self, card: SeenCard, image_height: int, mat_edge: np.ndarray | None = None
+    ) -> Zone:
+        """Zone of a card: by its distance to the mat's far edge, or by its height in the image.
+
+        ``mat_edge`` is the row of the mat's far edge in every column (``-1`` where there is no
+        mat), see :func:`~blackjack_vision.vision_classic.mat.mat_far_edge`.
+        """
         if card.corners is None:
             return Zone.PLAYER
-        centre_y = float(np.asarray(card.corners)[:, 1].mean())
+        corners = np.asarray(card.corners, np.float64)
+        centre_x, centre_y = corners.mean(axis=0)
+        if mat_edge is not None and len(mat_edge):
+            column = int(np.clip(round(centre_x), 0, len(mat_edge) - 1))
+            edge = float(mat_edge[column])
+            if edge >= 0:
+                card_height = float(corners[:, 1].max() - corners[:, 1].min())
+                depth = (centre_y - edge) / max(card_height, 1.0)
+                return Zone.DEALER if depth < self.dealer_depth else Zone.PLAYER
         return Zone.DEALER if centre_y < self.dealer_line * image_height else Zone.PLAYER
 
     # Feeding ------------------------------------------------------------------------------------
@@ -144,6 +183,8 @@ class Table:
         *,
         mat_in_view: bool | None = None,
         motion: np.ndarray | None = None,
+        mat_edge: np.ndarray | None = None,
+        image_width: int | None = None,
     ) -> TableUpdate:
         """Feed the cards of one frame (``visible``) and those recognised in it (``new_cards``).
 
@@ -154,9 +195,14 @@ class Table:
         ``motion`` is the camera motion since the previous frame (``2 x 3``, see
         :class:`~blackjack_vision.vision_classic.camera_motion.CameraMotion`). It moves the last
         position of the cards out of view, so a card found again after a head turn is still
-        recognised as the same card.
+        recognised as the same card. ``mat_edge`` places the cards in their zone (see
+        :meth:`zone_of`). With ``image_width`` (and the camera motion) the cards only count as
+        collected when the place where they were is in view: looking at the laptop with a corner
+        of the mat in the image is not an empty table.
         """
         update = TableUpdate()
+        if mat_edge is not None:
+            self.mat_edge = mat_edge if (np.asarray(mat_edge) >= 0).any() else None
 
         if not visible:
             self._empty_frames += 1
@@ -166,7 +212,7 @@ class Table:
             if self._empty_frames >= self.clear_frames and self._round_has_cards():
                 if self.round.phase is Phase.FINISHED:
                     self._new_round(update, "table cleared after the round")
-                elif mat_in_view:
+                elif mat_in_view and self._dealt_in_view(image_width, image_height):
                     self._new_round(update, "cards collected")
         else:
             self._empty_frames = 0
@@ -182,11 +228,11 @@ class Table:
         for card in new_cards:
             if card.card is None:
                 continue
-            zone = self.zone_of(card, image_height)
+            zone = self.zone_of(card, image_height, mat_edge)
             self._zones[card.track_id] = zone
             if self.round.phase is Phase.FINISHED:
                 self._new_round(update, "new cards after the round ended")
-            lost = self._refound(card, zone, in_view)
+            lost = self._refound(card, zone, in_view, image_width, image_height)
             if lost is not None:
                 lost.track_id = card.track_id  # the dealt card now follows the new track
                 lost.centre = _centre(card)
@@ -197,7 +243,7 @@ class Table:
             if self._deal(card.card, zone, update):
                 self._dealt.append(_Dealt(card.card.code, zone, card.track_id, _centre(card)))
 
-        self._update_hole_card(visible, image_height)
+        self._update_hole_card(visible, image_height, mat_edge)
         self._update_advice(update)
         return update
 
@@ -214,6 +260,24 @@ class Table:
 
     # Internals ----------------------------------------------------------------------------------
 
+    def _dealt_in_view(self, image_width: int | None, image_height: int) -> bool:
+        """Whether the last positions of the dealt cards are inside the image."""
+        if image_width is None:
+            return True
+        return all(self._inside(dealt.centre, image_width, image_height) for dealt in self._dealt)
+
+    @staticmethod
+    def _inside(point: np.ndarray, width: int | None, height: int | None) -> bool:
+        """Whether a point is inside the image, 5 % away from its border (``True`` if unknown)."""
+        if width is None or height is None:
+            return True
+        x, y = point
+        margin = 0.05
+        return bool(
+            margin * width <= x <= (1 - margin) * width
+            and margin * height <= y <= (1 - margin) * height
+        )
+
     def _round_has_cards(self) -> bool:
         return bool(self.round.dealer.cards) or any(len(hand) for hand in self.round.hands)
 
@@ -222,8 +286,20 @@ class Table:
         self.reset()
         update.events.append(f"New round ({reason})")
 
-    def _refound(self, card: SeenCard, zone: Zone, in_view: set[int]) -> _Dealt | None:
-        """The dealt card this one is, if an equal card of the zone lost its track nearby."""
+    def _refound(
+        self,
+        card: SeenCard,
+        zone: Zone,
+        in_view: set[int],
+        image_width: int | None = None,
+        image_height: int | None = None,
+    ) -> _Dealt | None:
+        """The dealt card this one is, if an equal card of the zone lost its track nearby.
+
+        "Nearby" only applies when the lost card's last position is inside the image (we were
+        looking there, so a card elsewhere is another one). When it fell outside, the head was
+        turned away and its position is only a guess, so the code and the zone decide.
+        """
         centre = _centre(card)
         size = _size(card)
         best: _Dealt | None = None
@@ -232,7 +308,10 @@ class Table:
             if dealt.code != card.card.code or dealt.zone is not zone or dealt.track_id in in_view:
                 continue
             distance = float(np.hypot(*(centre - dealt.centre)))
-            if distance <= self.refound_distance * size and distance < best_distance:
+            near = distance <= self.refound_distance * size
+            if not near and not self._inside(dealt.centre, image_width, image_height):
+                near = True  # lost while looking away
+            if near and distance < best_distance:
                 best, best_distance = dealt, distance
         return best
 
@@ -260,11 +339,13 @@ class Table:
             f"Round over: {', '.join(self.last_results)} (net {self.round.net:+.1f})"
         )
 
-    def _update_hole_card(self, visible: Sequence[SeenCard], image_height: int) -> None:
+    def _update_hole_card(
+        self, visible: Sequence[SeenCard], image_height: int, mat_edge: np.ndarray | None
+    ) -> None:
         seen = set()
         for card in visible:
             seen.add(card.track_id)
-            if card.card is None and self.zone_of(card, image_height) is Zone.DEALER:
+            if card.card is None and self.zone_of(card, image_height, mat_edge) is Zone.DEALER:
                 self._unknown_frames[card.track_id] = self._unknown_frames.get(card.track_id, 0) + 1
             else:
                 self._unknown_frames.pop(card.track_id, None)
