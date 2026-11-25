@@ -62,7 +62,7 @@ from blackjack_vision.security.aces import (
 )
 from blackjack_vision.ui.dashboard import Dashboard
 from blackjack_vision.ui.hud import draw_hud
-from blackjack_vision.vision_classic.mat import mat_in_view
+from blackjack_vision.vision_classic.mat import mat_far_edge, mat_in_view
 from blackjack_vision.vision_classic.rectify import rectify_card
 from blackjack_vision.vision_dl.hybrid_recognizer import RECOGNIZERS, load_recognizer
 
@@ -190,6 +190,9 @@ def lock_text(system: SecuritySystem) -> str:
     return "LOCKED  " + "#" * decoder.progress + "." * (len(decoder.secret) - decoder.progress)
 
 
+CLEAR_AFTER_UNLOCK = 10
+"""Frames without cards needed after the unlock before the game starts."""
+
 KEYS = {
     ord("q"): "quit",
     27: "quit",
@@ -219,6 +222,10 @@ def main(argv: list[str] | None = None) -> int:
     hud = None
     fps = 0.0
     locked = security is not None
+    # After the unlock the last ace is still on the table: the game starts once the table has
+    # been seen empty for CLEAR_AFTER_UNLOCK frames, so the aces of the lock are not dealt.
+    clearing = False
+    empty_frames = 0
 
     def run_command(command: str) -> bool:
         """Keys and dashboard buttons. Returns ``False`` to quit."""
@@ -276,23 +283,39 @@ def main(argv: list[str] | None = None) -> int:
                         event, _ = system.update(crops, frame.timestamp, ranks)
                         if event is DecoderEvent.UNLOCKED:
                             feedback.say("Desbloqueado")
-                            logger.info("Unlocked")
+                            logger.info("Unlocked: waiting for the table to be cleared")
+                            clearing, empty_frames = True, 0
                         elif event in (DecoderEvent.WRONG, DecoderEvent.TIMEOUT):
                             logger.info("Lock: %s (%s)", event.value, lock_text(system))
                         cards = [LockCard(i, card.corners) for i, card in enumerate(detected)]
                         text = lock_text(system)
                         hud = draw_hud(image, cards, fps, lock_text=text, locked=True)
                         web_view = hud
+                    elif clearing:
+                        detected = pipeline.detector(image).cards
+                        empty_frames = 0 if detected else empty_frames + 1
+                        if empty_frames >= CLEAR_AFTER_UNLOCK:
+                            clearing = False
+                            table.reset()
+                            pipeline.reset()
+                            logger.info("Table cleared: the game starts")
+                        cards = [LockCard(i, card.corners) for i, card in enumerate(detected)]
+                        hud = draw_hud(image, cards, fps, lock_text="UNLOCKED  retira las cartas")
+                        web_view = hud
                     else:
                         result = pipeline.process(image)
                         # Only needed when no card is seen: empty table, or head turned away?
                         on_mat = mat_in_view(image) if not result.cards else None
+                        # Zones from the far edge of the mat, which moves with the head.
+                        edge = mat_far_edge(image) if result.new_cards or result.cards else None
                         update = table.update(
                             result.cards,
                             result.new_cards,
                             image.shape[0],
                             mat_in_view=on_mat,
                             motion=result.motion,
+                            mat_edge=edge,
+                            image_width=image.shape[1],
                         )
                         for event in update.events:
                             logger.info(event)
@@ -348,13 +371,16 @@ def main(argv: list[str] | None = None) -> int:
                 key = cv2.waitKey(1 if not paused else 30) & 0xFF
                 if key in KEYS:
                     running = run_command(KEYS[key]) and running
+    except KeyboardInterrupt:
+        logger.info("Stopped (Ctrl+C)")
     finally:
         if dashboard is not None:
             dashboard.close()
-
-    if writer is not None:
-        writer.release()
-    cv2.destroyAllWindows()
+        # Also on Ctrl+C: an MP4 that is not closed has no index and cannot be played.
+        if writer is not None:
+            writer.release()
+            logger.info("Video saved to %s", args.save)
+        cv2.destroyAllWindows()
     logger.info(
         "Rounds: %d  %s", table.rounds_played + 1, table.shoe.summary() if table.shoe else ""
     )
