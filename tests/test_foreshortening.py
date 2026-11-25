@@ -182,3 +182,39 @@ def test_for_glasses_preset():
 def test_negative_prior_weight_is_rejected():
     with pytest.raises(ValueError):
         CardDetectorConfig(foreshortening_prior_weight=-0.1)
+
+
+def test_one_card_seen_from_above_gives_the_scale():
+    # Glasses looking down at a single card (the lock shows the aces one at a time): the card
+    # looks taller than wide, which only an upright card with c > 0.72 explains.
+    from blackjack_vision.detection_tracking.card_detector import estimate_from_few
+
+    quad = squashed_quad(angle=0, scale=0.85)
+    assert estimate_from_few([quad]) == pytest.approx(0.85, abs=0.03)
+
+
+def test_one_card_that_looks_wide_gives_nothing():
+    from blackjack_vision.detection_tracking.card_detector import estimate_from_few
+
+    # Upright at c=0.5 looks wider than tall, and so does a card lying sideways: ambiguous.
+    assert estimate_from_few([squashed_quad(angle=0, scale=0.5)]) is None
+
+
+def test_glasses_detector_finds_a_lone_card_seen_from_above():
+    # Before the fix the detector kept the glasses' default 0.5 and rejected the card.
+    detector = CardDetector(CardDetectorConfig.for_glasses())
+    lone = squashed(scene_with_cards([placed_corners((320, 480), 220)], size=SIZE), 0.9)
+    results = [detector.detect(lone) for _ in range(3)]
+    assert all(len(result.cards) == 1 for result in results)
+    # The card gets its own scale; the scale of the frame is not moved by one card (with the
+    # glasses the near cards look less squashed than the far ones).
+    assert results[-1].foreshortening == pytest.approx(0.5)
+    edges = side_lengths(results[-1].cards[0].corners)
+    assert edges[0] < edges[1]  # upright: the first edge is the short top side
+
+
+def squashed_quad(angle: float, scale: float) -> np.ndarray:
+    """Corners of an upright 63 x 88 card (turned by ``angle``) squashed vertically by ``scale``."""
+    quad = placed_corners((300, 300), 176, angle_deg=angle).astype(np.float64)
+    quad[:, 1] *= scale
+    return quad

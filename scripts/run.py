@@ -380,12 +380,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logger.info("Stopped (Ctrl+C)")
     finally:
-        if dashboard is not None:
-            dashboard.close()
-        # Also on Ctrl+C: an MP4 that is not closed has no index and cannot be played.
+        # First of all, also on Ctrl+C: an MP4 that is not closed has no index and cannot be
+        # played, so nothing that may block or be interrupted (the dashboard) goes before it.
         if writer is not None:
             writer.release()
             logger.info("Video saved to %s", args.save)
+        if dashboard is not None:
+            dashboard.close()
         cv2.destroyAllWindows()
     logger.info(
         "Rounds: %d  %s", table.rounds_played + 1, table.shoe.summary() if table.shoe else ""

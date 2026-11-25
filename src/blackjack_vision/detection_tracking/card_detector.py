@@ -366,8 +366,16 @@ class CardDetector:
         for corners, contour, area in candidates:
             corrected = _stretch(corners, 1.0 / scale)
             if not low <= aspect_ratio(corrected) <= high:
-                result.clusters.append(contour)
-                quad_blobs.append(contour)
+                # The scale of the frame does not fit this card. A card that looks taller than
+                # wide is still a card when one scale only explains it (seen from above: the
+                # glasses looking down at a lone ace, or a card near the camera, which looks
+                # less squashed than the far ones). Its own scale also orders its corners.
+                own = estimate_from_few([corners], config.foreshortening_range, (low, high))
+                if own is None:
+                    result.clusters.append(contour)
+                    quad_blobs.append(contour)
+                    continue
+                result.cards.append(CardDetection(_portrait(corners, own), contour, area))
                 continue
             result.cards.append(CardDetection(_portrait(corners, scale), contour, area))
 
@@ -505,6 +513,55 @@ def estimate_foreshortening(
 def _portrait(corners: np.ndarray, scale: float) -> np.ndarray:
     """Corners ordered on the shape corrected by ``1 / scale``, so that 0 -> 1 is a short side."""
     return _stretch(order_corners(_stretch(corners, 1.0 / scale)), scale).astype(np.float32)
+
+
+def estimate_from_few(
+    quads: list[np.ndarray],
+    search_range: tuple[float, float] = (0.4, 1.0),
+    candidate_aspect_range: tuple[float, float] = (1.0, 3.2),
+    steps: int = 121,
+    tolerance: float = 0.05,
+    min_scale: float = 0.78,
+) -> float | None:
+    """Vertical scale of the table from a few cards, when only one value explains them all.
+
+    A card lying upright looks ``88 c`` tall and ``63`` wide; lying sideways, ``88`` wide and
+    ``63 c`` tall. A card that looks wider than tall fits both (upright with a small ``c``, or
+    sideways), so it says nothing. A card that looks taller than wide can only be upright with
+    ``c = (h / w) * 63 / 88`` above about 0.72: the camera looks at the table from above. This is
+    what was missing with the glasses looking down at a single card (the lock shows the aces one at
+    a time): the detector kept the default 0.5 and threw the card away as too long. The detector
+    uses it per card, for the cards the scale of the frame does not explain, and never to move the
+    scale of the frame: with the glasses the near cards look less squashed than the far ones.
+
+    Returns the scale when the error curve of every quad has a single minimum below
+    ``tolerance`` in ``search_range``, they agree and it is at least ``min_scale``, otherwise
+    ``None``. The lower bound keeps out a square (a square is an upright card at ``c = 0.72``) and
+    a lone card lying sideways, whose only solution is a small ``c`` that the default already
+    covers: only the "seen from above" case, which the default cannot explain, moves the scale.
+    """
+    low, high = candidate_aspect_range
+    usable = [quad for quad in quads if low <= aspect_ratio(quad) <= high]
+    if not usable:
+        return None
+    scales = np.linspace(search_range[0], search_range[1], steps)
+    solutions = []
+    for quad in usable:
+        errors = np.array(
+            [abs(np.log(aspect_ratio(_stretch(quad, 1.0 / c)) / CARD_ASPECT_RATIO)) for c in scales]
+        )
+        good = errors < tolerance
+        if not good.any():
+            return None
+        # Separate runs of good scales are separate explanations (upright or sideways).
+        runs = np.flatnonzero(np.diff(good.astype(int)) == 1).size + int(good[0])
+        if runs != 1:
+            return None
+        solutions.append(float(scales[np.argmin(np.where(good, errors, np.inf))]))
+    if max(solutions) - min(solutions) > 0.1:
+        return None
+    scale = float(np.median(solutions))
+    return scale if scale >= min_scale else None
 
 
 def _stretch(corners: np.ndarray, factor: float) -> np.ndarray:
