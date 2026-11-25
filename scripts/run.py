@@ -111,7 +111,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="web dashboard on http://localhost:PORT (8000 if no port is given)",
     )
     parser.add_argument(
-        "--web-host", default="127.0.0.1", help="dashboard address (127.0.0.1: only this PC)"
+        "--web-host",
+        default="127.0.0.1",
+        help="dashboard address (127.0.0.1: only this PC; 0.0.0.0 lets anyone on the network "
+        "watch it and press its buttons)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
@@ -248,7 +251,10 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "snapshot" and hud is not None:
             path = write_image(args.snapshots / f"run_{int(time.time() * 1000)}.png", hud)
             logger.info("Saved %s", path)
-        if dashboard is not None and command in ("new_round", "new_shoe", "lock"):
+        logged = (
+            ("new_round", "new_shoe", "lock") if security is not None else ("new_round", "new_shoe")
+        )
+        if dashboard is not None and command in logged:
             label = {"new_round": "Nueva ronda", "new_shoe": "Nuevo sabot", "lock": "Bloqueado"}
             dashboard.log(label[command])
         return True

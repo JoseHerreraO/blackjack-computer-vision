@@ -175,6 +175,7 @@ def test_run_feeds_the_dashboard(tmp_path):
             super().__init__(host, 0)
             created.append(self)
             self._commands.put("new_shoe")
+            self._commands.put("lock")
 
     run = runpy.run_path(str(SCRIPTS / "run.py"), run_name="run_cli")
     run["main"].__globals__["build_recognizer"] = lambda args: FakeRecognizer()
@@ -193,4 +194,37 @@ def test_run_feeds_the_dashboard(tmp_path):
     assert [card["code"] for card in hand["cards"]] == ["9H"]
     log = [line["text"] for line in snapshot["log"]]
     assert "Nuevo sabot" in log and "9H to the player" in log
+    assert "Bloqueado" not in log  # "lock" does nothing without the lock
     assert snapshot["lock"]["enabled"] is False and not snapshot["locked"]
+
+
+def _post(server: Dashboard, name: str, headers: dict[str, str] | None = None) -> int:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{server.port}/command/{name}", method="POST", headers=headers or {}
+    )
+    try:
+        return urllib.request.urlopen(request).status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+def test_other_web_pages_cannot_use_the_dashboard(dashboard):
+    own = f"http://127.0.0.1:{dashboard.port}"
+    assert _post(dashboard, "pause", {"Origin": "https://evil.example"}) == 403
+    assert _post(dashboard, "pause", {"Host": f"evil.example:{dashboard.port}"}) == 403
+    assert dashboard.commands() == []  # neither reached the main loop
+    assert _post(dashboard, "pause", {"Origin": own}) == 200  # the dashboard's own buttons
+    assert _post(dashboard, "new_round", {"Host": f"localhost:{dashboard.port}"}) == 200
+    assert dashboard.commands() == ["pause", "new_round"]
+
+    rebound = urllib.request.Request(
+        f"{own}/state", headers={"Host": f"attacker.example:{dashboard.port}"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(rebound)
+    assert error.value.code == 403  # DNS rebinding cannot read the count either
+
+
+def test_state_has_the_table_rules():
+    rules = table_state(Table())["rules"]
+    assert rules == {"dealer_hits_soft_17": False, "blackjack_payout": 1.5}

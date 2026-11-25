@@ -13,7 +13,9 @@
   ``pause``. They are queued and the main loop runs them (:meth:`Dashboard.commands`), as it does
   with the keys of the OpenCV window.
 
-The server listens on ``127.0.0.1`` by default, so only this PC sees it. The lock secret never
+The server listens on ``127.0.0.1`` by default, so only this PC sees it. Other web pages open in
+the same browser cannot use it either: a request whose ``Host`` is not this PC's own name (DNS
+rebinding) or a command whose ``Origin`` is another site gets ``403``. The lock secret never
 leaves the main loop: the state only has how many aces of it have been shown.
 """
 
@@ -40,6 +42,7 @@ from blackjack_vision.blackjack.table import Table
 logger = logging.getLogger(__name__)
 
 COMMANDS = ("new_round", "new_shoe", "lock", "pause")
+LOOPBACK_NAMES = ("localhost", "127.0.0.1", "[::1]", "::1")
 BOUNDARY = "frame"
 JPEG_QUALITY = 80
 LOG_LINES = 12
@@ -79,6 +82,10 @@ def table_state(table: Table | None) -> dict[str, object] | None:
         "hands": [hand_state(hand, active=i == active) for i, hand in enumerate(round_.hands)],
         "advice": None if advice is None else {"action": advice.value, "label": advice.spanish},
         "results": list(table.last_results),
+        "rules": {
+            "dealer_hits_soft_17": table.rules.dealer_hits_soft_17,
+            "blackjack_payout": table.rules.blackjack_payout,
+        },
         "count": {
             "running": shoe.running_count,
             "true": round(shoe.true_count, 2),
@@ -237,7 +244,23 @@ class Dashboard:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _host_allowed(self) -> bool:
+                """Bound to this PC only: the request must name it (no DNS rebinding)."""
+                if dashboard._server.server_address[0] not in ("127.0.0.1", "::1"):
+                    return True  # --web-host on the network: any name of the PC
+                host = self.headers.get("Host", "")
+                name = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+                return name.lower() in LOOPBACK_NAMES
+
+            def _origin_allowed(self) -> bool:
+                """A command must come from the dashboard itself, not from another web page."""
+                origin = self.headers.get("Origin")
+                return origin is None or origin == f"http://{self.headers.get('Host', '')}"
+
             def do_GET(self) -> None:
+                if not self._host_allowed():
+                    self._send(b"Forbidden", "text/plain", HTTPStatus.FORBIDDEN)
+                    return
                 path = self.path.split("?", 1)[0]
                 if path in ("/", "/index.html"):
                     self._send(dashboard._page, "text/html; charset=utf-8")
@@ -250,6 +273,9 @@ class Dashboard:
                     self._send(b"Not found", "text/plain", HTTPStatus.NOT_FOUND)
 
             def do_POST(self) -> None:
+                if not (self._host_allowed() and self._origin_allowed()):
+                    self._send(b"Forbidden", "text/plain", HTTPStatus.FORBIDDEN)
+                    return
                 name = self.path.removeprefix("/command/")
                 if not self.path.startswith("/command/") or name not in COMMANDS:
                     self._send(b"Unknown command", "text/plain", HTTPStatus.NOT_FOUND)
