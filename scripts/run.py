@@ -13,11 +13,16 @@ Examples::
     set BJ_SECRET=SHDC
     python scripts/run.py --source bridge --model data/models/recognizer.joblib   # hybrid recogniser
     python scripts/run.py --source bridge --recognizer embedding --no-lock
+    python scripts/run.py --source bridge --model data/models/recognizer.joblib --web --no-window
     python scripts/run.py --source data/samples/<folder> --fps 15 --no-lock --recognizer embedding \
         --no-window --save outputs/demo.mp4
 
 With ``--source bridge`` the iOS app connects to this PC and the advice is spoken by the iPhone
 through the glasses. With other sources it is only logged.
+
+``--web`` also serves a dashboard on http://localhost:8000 (``ui/dashboard.py``): the video, the
+cards as cards, the advice, the count, the shoe and the voice log, with buttons for the commands
+below. With ``--no-window`` the browser is the only screen.
 
 Keys: q / Esc = quit, space = pause, r = new round, n = new shoe (count to 0), l = lock again,
 s = snapshot.
@@ -55,6 +60,7 @@ from blackjack_vision.security.aces import (
     SequenceDecoder,
     parse_secret,
 )
+from blackjack_vision.ui.dashboard import Dashboard
 from blackjack_vision.ui.hud import draw_hud
 from blackjack_vision.vision_classic.mat import mat_in_view
 from blackjack_vision.vision_classic.rectify import rectify_card
@@ -96,6 +102,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save", type=Path, help="write the annotated video to this file")
     parser.add_argument("--snapshots", type=Path, default=Path("outputs/run"))
     parser.add_argument("--no-window", action="store_true", help="run without a preview window")
+    parser.add_argument(
+        "--web",
+        type=int,
+        nargs="?",
+        const=8000,
+        metavar="PORT",
+        help="web dashboard on http://localhost:PORT (8000 if no port is given)",
+    )
+    parser.add_argument(
+        "--web-host", default="127.0.0.1", help="dashboard address (127.0.0.1: only this PC)"
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -112,12 +129,17 @@ class LockCard:
 class Feedback:
     """Speech and status for the player: through the glasses with the bridge, logged otherwise."""
 
-    def __init__(self, source: FrameSource, enabled: bool) -> None:
+    def __init__(
+        self, source: FrameSource, enabled: bool, dashboard: Dashboard | None = None
+    ) -> None:
         self.bridge = source if isinstance(source, BridgeSource) and enabled else None
+        self.dashboard = dashboard
         self._last_status: str | None = None
 
     def say(self, text: str) -> None:
         logger.info("SAY: %s", text)
+        if self.dashboard is not None:
+            self.dashboard.log(text, "say")
         if self.bridge is not None and not self.bridge.say(text):
             logger.debug("iPhone not connected, advice not spoken")
 
@@ -168,6 +190,17 @@ def lock_text(system: SecuritySystem) -> str:
     return "LOCKED  " + "#" * decoder.progress + "." * (len(decoder.secret) - decoder.progress)
 
 
+KEYS = {
+    ord("q"): "quit",
+    27: "quit",
+    ord(" "): "pause",
+    ord("r"): "new_round",
+    ord("n"): "new_shoe",
+    ord("l"): "lock",
+    ord("s"): "snapshot",
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
@@ -178,99 +211,146 @@ def main(argv: list[str] | None = None) -> int:
     security = build_security(args)
     pipeline = CardPipeline(recognizer, detector=CardDetector(config_for_view(view_name)))
     table = Table(decks=args.decks, dealer_line=args.dealer_line)
+    dashboard = Dashboard(args.web_host, args.web).start() if args.web is not None else None
 
     frame_times: deque[float] = deque(maxlen=30)
     writer: cv2.VideoWriter | None = None
     paused = False
     hud = None
-    with open_source(args.source, fps=args.fps) as source:
-        feedback = Feedback(source, enabled=not args.no_voice)
-        if isinstance(source, BridgeSource):
-            logger.info("Waiting for the iPhone on port %d", source.port)
-        while True:
-            if not paused or hud is None:
-                frame = source.read()
-                if frame is None:
-                    break
-                image = frame.image
-                frame_times.append(time.perf_counter())
-                fps = (
-                    (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
-                    if len(frame_times) > 1
-                    else 0.0
-                )
+    fps = 0.0
+    locked = security is not None
 
-                locked = security is not None and not security[0].unlocked
-                if locked:
-                    system, classic = security
-                    detected = pipeline.detector(image).cards
-                    crops = [rectify_card(image, card.corners) for card in detected]
-                    ranks = None
-                    if args.use_rank and crops:
-                        ranks = [p.rank for p in classic.predict_many(crops)]
-                    event, _ = system.update(crops, frame.timestamp, ranks)
-                    if event is DecoderEvent.UNLOCKED:
-                        feedback.say("Desbloqueado")
-                        logger.info("Unlocked")
-                    elif event in (DecoderEvent.WRONG, DecoderEvent.TIMEOUT):
-                        logger.info("Lock: %s (%s)", event.value, lock_text(system))
-                    cards = [LockCard(i, card.corners) for i, card in enumerate(detected)]
-                    hud = draw_hud(image, cards, fps, lock_text=lock_text(system), locked=True)
-                else:
-                    result = pipeline.process(image)
-                    # Only needed when no card is seen: empty table, or head turned away?
-                    on_mat = mat_in_view(image) if not result.cards else None
-                    update = table.update(
-                        result.cards,
-                        result.new_cards,
-                        image.shape[0],
-                        mat_in_view=on_mat,
-                        motion=result.motion,
-                    )
-                    for event in update.events:
-                        logger.info(event)
-                    for phrase in update.speech:
-                        feedback.say(phrase)
-                    feedback.status(
-                        f"RC {table.shoe.running_count:+d} TC {table.shoe.true_count:+.1f}"
-                        f" bet {table.shoe.bet_units()}u"
-                    )
-                    text = lock_text(security[0]) if security is not None else None
-                    hud = draw_hud(image, result.cards, fps, table=table, lock_text=text)
+    def run_command(command: str) -> bool:
+        """Keys and dashboard buttons. Returns ``False`` to quit."""
+        nonlocal paused
+        if command == "quit":
+            return False
+        if command == "pause":
+            paused = not paused
+        elif command == "new_round":
+            table.reset()
+            pipeline.reset()
+            logger.info("New round (key)")
+        elif command == "new_shoe":
+            table.reset(reshuffle=True)
+            pipeline.reset()
+            logger.info("New shoe: count back to 0")
+        elif command == "lock" and security is not None:
+            security[0].decoder.reset()
+            logger.info("Locked again")
+        elif command == "snapshot" and hud is not None:
+            path = write_image(args.snapshots / f"run_{int(time.time() * 1000)}.png", hud)
+            logger.info("Saved %s", path)
+        if dashboard is not None and command in ("new_round", "new_shoe", "lock"):
+            label = {"new_round": "Nueva ronda", "new_shoe": "Nuevo sabot", "lock": "Bloqueado"}
+            dashboard.log(label[command])
+        return True
 
-                if args.save is not None:
-                    if writer is None:
-                        args.save.parent.mkdir(parents=True, exist_ok=True)
-                        rate = source.fps or 15.0
-                        size = (hud.shape[1], hud.shape[0])
-                        writer = cv2.VideoWriter(
-                            str(args.save), cv2.VideoWriter_fourcc(*"mp4v"), rate, size
+    try:
+        with open_source(args.source, fps=args.fps) as source:
+            feedback = Feedback(source, enabled=not args.no_voice, dashboard=dashboard)
+            if isinstance(source, BridgeSource):
+                logger.info("Waiting for the iPhone on port %d", source.port)
+            running = True
+            while running:
+                if not paused or hud is None:
+                    frame = source.read()
+                    if frame is None:
+                        break
+                    image = frame.image
+                    frame_times.append(time.perf_counter())
+                    fps = (
+                        (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
+                        if len(frame_times) > 1
+                        else 0.0
+                    )
+
+                    locked = security is not None and not security[0].unlocked
+                    if locked:
+                        system, classic = security
+                        detected = pipeline.detector(image).cards
+                        crops = [rectify_card(image, card.corners) for card in detected]
+                        ranks = None
+                        if args.use_rank and crops:
+                            ranks = [p.rank for p in classic.predict_many(crops)]
+                        event, _ = system.update(crops, frame.timestamp, ranks)
+                        if event is DecoderEvent.UNLOCKED:
+                            feedback.say("Desbloqueado")
+                            logger.info("Unlocked")
+                        elif event in (DecoderEvent.WRONG, DecoderEvent.TIMEOUT):
+                            logger.info("Lock: %s (%s)", event.value, lock_text(system))
+                        cards = [LockCard(i, card.corners) for i, card in enumerate(detected)]
+                        text = lock_text(system)
+                        hud = draw_hud(image, cards, fps, lock_text=text, locked=True)
+                        web_view = hud
+                    else:
+                        result = pipeline.process(image)
+                        # Only needed when no card is seen: empty table, or head turned away?
+                        on_mat = mat_in_view(image) if not result.cards else None
+                        update = table.update(
+                            result.cards,
+                            result.new_cards,
+                            image.shape[0],
+                            mat_in_view=on_mat,
+                            motion=result.motion,
                         )
-                    writer.write(hud)
+                        for event in update.events:
+                            logger.info(event)
+                            if dashboard is not None:
+                                dashboard.log(event)
+                        for phrase in update.speech:
+                            feedback.say(phrase)
+                        feedback.status(
+                            f"RC {table.shoe.running_count:+d} TC {table.shoe.true_count:+.1f}"
+                            f" bet {table.shoe.bet_units()}u"
+                        )
+                        text = lock_text(security[0]) if security is not None else None
+                        hud = draw_hud(image, result.cards, fps, table=table, lock_text=text)
+                        web_view = hud
+                        if dashboard is not None and dashboard.watching:
+                            # The page shows the hands and the count itself.
+                            web_view = draw_hud(
+                                image, result.cards, fps, table=table, lock_text=text, panel=False
+                            )
 
-            if args.no_window:
-                continue
-            scale = min(1.0, PREVIEW_MAX_HEIGHT / hud.shape[0])
-            cv2.imshow(WINDOW, cv2.resize(hud, None, fx=scale, fy=scale) if scale < 1 else hud)
-            key = cv2.waitKey(1 if not paused else 30) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if key == ord(" "):
-                paused = not paused
-            elif key == ord("r"):
-                table.reset()
-                pipeline.reset()
-                logger.info("New round (key)")
-            elif key == ord("n"):
-                table.reset(reshuffle=True)
-                pipeline.reset()
-                logger.info("New shoe: count back to 0")
-            elif key == ord("l") and security is not None:
-                security[0].decoder.reset()
-                logger.info("Locked again")
-            elif key == ord("s"):
-                path = write_image(args.snapshots / f"run_{int(time.time() * 1000)}.png", hud)
-                logger.info("Saved %s", path)
+                    if dashboard is not None:
+                        dashboard.publish_frame(web_view)
+                    if args.save is not None:
+                        if writer is None:
+                            args.save.parent.mkdir(parents=True, exist_ok=True)
+                            rate = source.fps or 15.0
+                            size = (hud.shape[1], hud.shape[0])
+                            writer = cv2.VideoWriter(
+                                str(args.save), cv2.VideoWriter_fourcc(*"mp4v"), rate, size
+                            )
+                        writer.write(hud)
+
+                if dashboard is not None:
+                    decoder = security[0].decoder if security is not None else None
+                    dashboard.publish_state(
+                        table,
+                        fps=fps,
+                        locked=locked,
+                        lock_progress=decoder.progress if decoder else 0,
+                        lock_length=len(decoder.secret) if decoder else 0,
+                        paused=paused,
+                        source=str(args.source),
+                    )
+                    for command in dashboard.commands():
+                        running = run_command(command) and running
+
+                if args.no_window:
+                    if paused:
+                        time.sleep(0.05)  # nothing to read: wait for the dashboard
+                    continue
+                scale = min(1.0, PREVIEW_MAX_HEIGHT / hud.shape[0])
+                cv2.imshow(WINDOW, cv2.resize(hud, None, fx=scale, fy=scale) if scale < 1 else hud)
+                key = cv2.waitKey(1 if not paused else 30) & 0xFF
+                if key in KEYS:
+                    running = run_command(KEYS[key]) and running
+    finally:
+        if dashboard is not None:
+            dashboard.close()
 
     if writer is not None:
         writer.release()

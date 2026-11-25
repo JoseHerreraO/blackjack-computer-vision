@@ -25,6 +25,9 @@ yolo = ["ultralytics>=8.3"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"blackjack_vision.ui" = ["*.html"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
